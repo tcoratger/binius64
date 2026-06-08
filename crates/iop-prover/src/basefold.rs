@@ -3,18 +3,17 @@
 
 use binius_field::{BinaryField, PackedField};
 use binius_iop::merkle_tree::MerkleTreeScheme;
-use binius_ip::sumcheck::RoundCoeffs;
+use binius_ip::{mlecheck, sumcheck::RoundCoeffs};
 use binius_ip_prover::sumcheck::{
 	bivariate_product::BivariateProductSumcheckProver, common::SumcheckProver,
+	multilinear_eval::MultilinearEvalProver,
 };
-use binius_math::{
-	FieldBuffer, inner_product::inner_product_par, line::extrapolate_line_packed, ntt::AdditiveNTT,
-};
+use binius_math::{FieldBuffer, ntt::AdditiveNTT};
 use binius_transcript::{
 	ProverTranscript,
 	fiat_shamir::{CanSample, Challenger},
 };
-use binius_utils::{SerializeBytes, rayon::prelude::*};
+use binius_utils::SerializeBytes;
 
 use crate::{
 	fri::{FRIFoldProver, FoldRoundOutput},
@@ -162,32 +161,35 @@ where
 	}
 }
 
-/// Performs ZK batching setup and returns a BaseFoldProver for the remaining protocol.
+/// Proves a multilinear evaluation claim `witness(eval_point) = eval_claim` by interleaving an
+/// [`MultilinearEvalProver`] MLE-check with FRI folding (the second, FRI-interleaved sumcheck of
+/// the Batched ZK BaseFold construction).
 ///
-/// This handles the zero-knowledge case where the witness is blinded with a random mask.
-/// It performs the initial unbatch round and returns a prover configured for the remaining
-/// n rounds of sumcheck + FRI.
+/// The masked oracle `π' = π + γ·ω` has already been formed by the caller (it is passed as
+/// `witness`) and the linear opening claim has already been reduced to this point evaluation by a
+/// prior batched sumcheck. Here we only run the degree-1 MLE-check on `witness` against
+/// `eval_point`, interleaved with the FRI codeword of the committed interleaved `[π ‖ ω]`.
 ///
 /// ## Arguments
 ///
-/// * `multilinear` - batched (witness || mask) polynomial with log_len = n+1
-/// * `transparent_multilinear` - l_poly with log_len = n
-/// * `claim` - the original sumcheck claim (before ZK batching)
-/// * `fri_folder` - FRI fold prover with n_rounds = n+1
-/// * `transcript` - prover transcript
+/// * `witness` - the masked oracle multilinear `π'` with `log_len = n`
+/// * `eval_point` - the evaluation point `ρ` with `len = n`, in low-to-high variable order
+/// * `eval_claim` - the claimed value `π'(ρ)`
+/// * `batch_challenge` - the masking challenge `γ`; folds the interleaved `[π ‖ ω]` codeword down
+///   to the codeword of `π'` in the FRI unbatch round
+/// * `fri_folder` - the FRI fold prover over the `[π ‖ ω]` codeword, with `n_rounds == n + 1`
+/// * `transcript` - the prover transcript
 ///
-/// ## Returns
-///
-/// A `BaseFoldProver` configured for the remaining n rounds. Caller should call
-/// `.prove(transcript)`.
-pub fn prove_zk<'a, F, P, NTT, MerkleScheme, MerkleProver, Challenger_>(
-	mut multilinear: FieldBuffer<P>,
-	mask: FieldBuffer<P>,
-	transparent_multilinear: FieldBuffer<P>,
-	sum_claim: F,
+/// The final FRI value equals the final MLE-check value `π'(r)` (see
+/// [`binius_iop::basefold::mlecheck_fri_consistency`]).
+pub fn prove_mlecheck_basefold_zk<'a, F, P, NTT, MerkleScheme, MerkleProver, Challenger_>(
+	witness: FieldBuffer<P>,
+	eval_point: &[F],
+	eval_claim: F,
+	batch_challenge: F,
 	mut fri_folder: FRIFoldProver<'a, F, P, NTT, MerkleProver>,
 	transcript: &mut ProverTranscript<Challenger_>,
-) -> BaseFoldProver<'a, F, P, NTT, MerkleProver>
+) -> Result<(), Error>
 where
 	F: BinaryField,
 	P: PackedField<Scalar = F>,
@@ -196,40 +198,45 @@ where
 	MerkleProver: MerkleTreeProver<F, Scheme = MerkleScheme>,
 	Challenger_: Challenger,
 {
-	let _scope = tracing::debug_span!("Basefold ZK setup").entered();
+	let _scope = tracing::debug_span!("Basefold MLE-check ZK").entered();
 
-	// The FRI folder operates on the codeword of the combined (witness || mask) polynomial,
-	// so `n_rounds == multilinear.log_len() + 1`.
-	let n_rounds = fri_folder.n_rounds();
-	assert_eq!(multilinear.log_len() + 1, n_rounds);
-	assert_eq!(mask.log_len(), multilinear.log_len());
-	assert_eq!(transparent_multilinear.log_len(), multilinear.log_len());
+	let n_vars = witness.log_len();
+	assert_eq!(eval_point.len(), n_vars);
+	// The FRI folder operates on the codeword of the interleaved (π ‖ ω) polynomial, so
+	// `n_rounds == n + 1`.
+	assert_eq!(n_vars + 1, fri_folder.n_rounds());
 
-	// Compute blinding_eval = sum_x[mask * l_poly]
-	// The verifier will compute sum = (1-r)*claim + r*blinding_eval using linear interpolation.
-	let mask_claim = inner_product_par(&mask, &transparent_multilinear);
-
-	// Write blinding_eval to transcript
-	transcript.message().write(&mask_claim);
-
-	// Sample batch challenge (before FRI fold round, matching verifier order)
-	let batch_challenge: F = transcript.sample();
-
-	// Receive batch challenge to advance to round 1 (no commitment at batch round)
+	// Unbatch round: fold the interleaved (π ‖ ω) codeword at the masking challenge to obtain the
+	// codeword of π'. No commitment is produced at this round.
 	fri_folder.receive_challenge(batch_challenge);
 
-	// Fold multilinear at its last variable.
-	let batch_challenge_broadcast = P::broadcast(batch_challenge);
-	(multilinear.as_mut(), mask.as_ref())
-		.into_par_iter()
-		.for_each(|(multilinear_i, mask_i)| {
-			*multilinear_i =
-				extrapolate_line_packed(*multilinear_i, *mask_i, batch_challenge_broadcast);
-		});
+	let mut sumcheck = MultilinearEvalProver::new(witness, eval_point, eval_claim)?;
+	for _ in 0..n_vars {
+		let mut round_coeffs_vec = sumcheck.execute()?;
+		let round_coeffs = round_coeffs_vec
+			.pop()
+			.expect("MultilinearEvalProver proves exactly one claim");
+		let commitment = fri_folder.execute_fold_round();
 
-	// Compute the batched sum using linear interpolation.
-	let batched_sum = extrapolate_line_packed(sum_claim, mask_claim, batch_challenge);
-	BaseFoldProver::new(multilinear, transparent_multilinear, batched_sum, fri_folder)
+		transcript
+			.message()
+			.write_scalar_slice(mlecheck::RoundProof::truncate(round_coeffs).coeffs());
+		if let FoldRoundOutput::Commitment(commitment) = commitment {
+			transcript.message().write(&commitment);
+		}
+
+		let challenge = transcript.sample();
+		sumcheck.fold(challenge)?;
+		fri_folder.receive_challenge(challenge);
+	}
+
+	let commitment = fri_folder.execute_fold_round();
+	if let FoldRoundOutput::Commitment(commitment) = commitment {
+		transcript.message().write(&commitment);
+	}
+	fri_folder.finish_proof(transcript);
+
+	Ok(())
 }
 
 #[cfg(test)]
@@ -244,16 +251,21 @@ mod test {
 	use binius_math::{
 		BinarySubspace, FieldBuffer,
 		inner_product::inner_product_buffers,
+		line::extrapolate_line_packed,
 		multilinear::eq::eq_ind_partial_eval,
 		ntt::{AdditiveNTT, NeighborsLastSingleThread, domain_context::GenericOnTheFly},
 		test_utils::{random_field_buffer, random_scalars},
 	};
-	use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
+	use binius_transcript::{
+		ProverTranscript,
+		fiat_shamir::{CanSample, HasherChallenger},
+	};
+	use binius_utils::rayon::prelude::*;
 	use rand::{SeedableRng, rngs::StdRng};
 
-	use super::{BaseFoldProver, prove_zk};
+	use super::{BaseFoldProver, prove_mlecheck_basefold_zk};
 	use crate::{
-		fri::{self, CommitOutput, FRIFoldProver},
+		fri::{self, CommitMaskedOutput, CommitOutput, FRIFoldProver},
 		merkle_tree::prover::BinaryMerkleTreeProver,
 	};
 
@@ -361,121 +373,6 @@ mod test {
 		*claim += P::Scalar::ONE
 	}
 
-	fn run_basefold_zk_prove_and_verify<F, P>(
-		witness: FieldBuffer<P>,
-		mask: FieldBuffer<P>,
-		evaluation_point: Vec<F>,
-		evaluation_claim: F,
-	) -> Result<()>
-	where
-		F: BinaryField,
-		P: PackedField<Scalar = F> + PackedExtension<F>,
-	{
-		let n_vars = evaluation_point.len();
-		assert_eq!(witness.log_len(), n_vars);
-		assert_eq!(mask.log_len(), n_vars);
-
-		let eval_point_eq = eq_ind_partial_eval::<P>(&evaluation_point);
-
-		let merkle_prover = BinaryMerkleTreeProver::<F, StdHashSuite>::new();
-
-		// Setup NTT with subspace dimension = witness.log_len + LOG_INV_RATE
-		let subspace = BinarySubspace::with_dim(n_vars + LOG_INV_RATE);
-		let domain_context = GenericOnTheFly::generate_from_subspace(&subspace);
-		let ntt = NeighborsLastSingleThread::new(domain_context);
-
-		// Create FRI params with log_batch_size = 1
-		let fri_params = binius_iop::fri::FRIParams::with_strategy(
-			ntt.domain_context(),
-			merkle_prover.scheme(),
-			n_vars + 1,
-			Some(1),
-			LOG_INV_RATE,
-			32,
-			&ConstantArityStrategy::new(2),
-		);
-
-		// Build the combined (witness || mask) buffer for commitment.
-		let combined_values: Vec<P> = witness
-			.as_ref()
-			.iter()
-			.chain(mask.as_ref())
-			.copied()
-			.collect();
-		let witness_plus_mask = FieldBuffer::new(n_vars + 1, combined_values.into_boxed_slice());
-
-		// Commit batched multilinear
-		let CommitOutput {
-			commitment: codeword_commitment,
-			committed: codeword_committed,
-			codeword,
-		} = fri::commit_interleaved(&fri_params, &ntt, &merkle_prover, witness_plus_mask.to_ref());
-
-		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		prover_transcript.message().write(&codeword_commitment);
-
-		let fri_folder =
-			FRIFoldProver::new(&fri_params, &ntt, &merkle_prover, codeword, &codeword_committed);
-
-		// Run prove_zk then continue with basefold prover
-		let prover = prove_zk(
-			witness,
-			mask,
-			eval_point_eq,
-			evaluation_claim,
-			fri_folder,
-			&mut prover_transcript,
-		);
-		prover.prove(&mut prover_transcript)?;
-
-		// Verify
-		let mut verifier_transcript = prover_transcript.into_verifier();
-		let retrieved_commitment = verifier_transcript.message().read()?;
-
-		let verifier_basefold::ReducedOutput {
-			final_fri_value,
-			final_sumcheck_value,
-			challenges,
-		} = verifier_basefold::verify_zk(
-			&fri_params,
-			merkle_prover.scheme(),
-			retrieved_commitment,
-			evaluation_claim,
-			&mut verifier_transcript,
-		)?;
-
-		// Check consistency - skip batch challenge (challenges[0])
-		let sumcheck_challenges = challenges[1..].to_vec();
-		if !verifier_basefold::sumcheck_fri_consistency(
-			final_fri_value,
-			final_sumcheck_value,
-			&evaluation_point,
-			sumcheck_challenges,
-		) {
-			bail!("Sumcheck and FRI are inconsistent");
-		}
-
-		Ok(())
-	}
-
-	#[test]
-	fn test_basefold_zk_valid_proof() {
-		type P = PackedBinaryGhash1x128b;
-
-		let n_vars = 8;
-		let mut rng = StdRng::seed_from_u64(0);
-
-		let witness = random_field_buffer::<P>(&mut rng, n_vars);
-		let mask = random_field_buffer::<P>(&mut rng, n_vars);
-		let evaluation_point = random_scalars(&mut rng, n_vars);
-
-		let eval_point_eq = eq_ind_partial_eval::<P>(&evaluation_point);
-		let evaluation_claim = inner_product_buffers(&witness, &eval_point_eq);
-
-		run_basefold_zk_prove_and_verify::<_, P>(witness, mask, evaluation_point, evaluation_claim)
-			.unwrap();
-	}
-
 	#[test]
 	fn test_basefold_valid_proof() {
 		type P = PackedBinaryGhash1x128b;
@@ -520,5 +417,129 @@ mod test {
 
 		run_basefold_prove_and_verify::<_, P>(multilinear, evaluation_point, evaluation_claim)
 			.unwrap();
+	}
+
+	/// Drives [`prove_mlecheck_basefold_zk`] against
+	/// [`binius_iop::basefold::verify_mlecheck_basefold_zk`]: commits the interleaved (π ‖ ω)
+	/// codeword, samples the masking challenge γ, forms π' = (1-γ)π + γω, and proves/verifies the
+	/// point-evaluation claim π'(ρ). If `tamper`, the claim is corrupted and verification must
+	/// fail.
+	fn run_mlecheck_basefold_zk_prove_and_verify<F, P>(
+		witness: FieldBuffer<P>,
+		evaluation_point: Vec<F>,
+		tamper: bool,
+	) -> Result<()>
+	where
+		F: BinaryField,
+		P: PackedField<Scalar = F> + PackedExtension<F>,
+	{
+		let n_vars = evaluation_point.len();
+		assert_eq!(witness.log_len(), n_vars);
+
+		let merkle_prover = BinaryMerkleTreeProver::<F, StdHashSuite>::new();
+
+		let subspace = BinarySubspace::with_dim(n_vars + LOG_INV_RATE);
+		let domain_context = GenericOnTheFly::generate_from_subspace(&subspace);
+		let ntt = NeighborsLastSingleThread::new(domain_context);
+
+		let fri_params = binius_iop::fri::FRIParams::with_strategy(
+			ntt.domain_context(),
+			merkle_prover.scheme(),
+			n_vars + 1,
+			Some(1),
+			LOG_INV_RATE,
+			32,
+			&ConstantArityStrategy::new(2),
+		);
+
+		// Commit the interleaved (witness ‖ mask), generating the mask internally.
+		let mut commit_rng = StdRng::seed_from_u64(7);
+		let CommitMaskedOutput {
+			commitment: codeword_commitment,
+			committed: codeword_committed,
+			codeword,
+			mask,
+		} = fri::commit_masked(&fri_params, &ntt, &merkle_prover, witness.to_ref(), &mut commit_rng);
+
+		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+		prover_transcript.message().write(&codeword_commitment);
+
+		// Sample the masking challenge γ and form π' = (1-γ)·witness + γ·mask.
+		let batch_challenge: F = prover_transcript.sample();
+		let mut witness_prime = witness.clone();
+		let gamma_broadcast = P::broadcast(batch_challenge);
+		(witness_prime.as_mut(), mask.as_ref())
+			.into_par_iter()
+			.for_each(|(w, &m)| {
+				*w = extrapolate_line_packed(*w, m, gamma_broadcast);
+			});
+
+		let eval_point_eq = eq_ind_partial_eval::<P>(&evaluation_point);
+		let mut eval_claim = inner_product_buffers(&witness_prime, &eval_point_eq);
+		if tamper {
+			eval_claim += F::ONE;
+		}
+
+		let fri_folder =
+			FRIFoldProver::new(&fri_params, &ntt, &merkle_prover, codeword, &codeword_committed);
+		prove_mlecheck_basefold_zk(
+			witness_prime,
+			&evaluation_point,
+			eval_claim,
+			batch_challenge,
+			fri_folder,
+			&mut prover_transcript,
+		)?;
+
+		let mut verifier_transcript = prover_transcript.into_verifier();
+		let retrieved_commitment = verifier_transcript.message().read()?;
+		let batch_challenge_v: F = verifier_transcript.sample();
+
+		let verifier_basefold::ReducedOutput {
+			final_fri_value,
+			final_sumcheck_value,
+			..
+		} = verifier_basefold::verify_mlecheck_basefold_zk(
+			&fri_params,
+			merkle_prover.scheme(),
+			retrieved_commitment,
+			eval_claim,
+			&evaluation_point,
+			batch_challenge_v,
+			&mut verifier_transcript,
+		)?;
+
+		if !verifier_basefold::mlecheck_fri_consistency(final_fri_value, final_sumcheck_value) {
+			bail!("MLE-check and FRI are inconsistent");
+		}
+
+		Ok(())
+	}
+
+	#[test]
+	fn test_mlecheck_basefold_zk_valid_proof() {
+		type P = PackedBinaryGhash1x128b;
+
+		let n_vars = 8;
+		let mut rng = StdRng::seed_from_u64(0);
+		let witness = random_field_buffer::<P>(&mut rng, n_vars);
+		let evaluation_point = random_scalars(&mut rng, n_vars);
+
+		run_mlecheck_basefold_zk_prove_and_verify::<_, P>(witness, evaluation_point, false)
+			.unwrap();
+	}
+
+	#[test]
+	fn test_mlecheck_basefold_zk_invalid_proof() {
+		type P = PackedBinaryGhash1x128b;
+
+		let n_vars = 8;
+		let mut rng = StdRng::seed_from_u64(0);
+		let witness = random_field_buffer::<P>(&mut rng, n_vars);
+		let evaluation_point = random_scalars(&mut rng, n_vars);
+
+		let result =
+			run_mlecheck_basefold_zk_prove_and_verify::<_, P>(witness, evaluation_point, true);
+		assert!(result.is_err());
 	}
 }

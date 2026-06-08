@@ -21,8 +21,11 @@
 //! [BCS16]: <https://eprint.iacr.org/2016/116>
 
 use binius_field::{BinaryField, Field};
-use binius_ip::sumcheck::{RoundCoeffs, RoundProof};
-use binius_math::{line::extrapolate_line_packed, multilinear::eq::eq_ind};
+use binius_ip::{
+	mlecheck,
+	sumcheck::{RoundCoeffs, RoundProof},
+};
+use binius_math::multilinear::eq::eq_ind;
 use binius_transcript::{
 	self as transcript, VerifierTranscript,
 	fiat_shamir::{CanSample, Challenger},
@@ -102,11 +105,29 @@ where
 	})
 }
 
-pub fn verify_zk<F, MTScheme, Challenger_>(
+/// Verifies a multilinear-evaluation BaseFold opening that interleaves a degree-1 MLE-check with
+/// FRI (the FRI-interleaved sumcheck of the Batched ZK BaseFold construction).
+///
+/// This is the verifier counterpart of `binius_iop_prover::basefold::prove_mlecheck_basefold_zk`.
+/// The masked oracle's opening claim
+/// has already been reduced to a point-evaluation claim `π'(eval_point) = eval_claim` by a prior
+/// batched sumcheck; this routine checks that claim against the committed codeword.
+///
+/// ## Arguments
+///
+/// * `eval_claim` - the claimed value `π'(eval_point)`
+/// * `eval_point` - the evaluation point `ρ` (length `n`), in low-to-high variable order
+/// * `batch_challenge` - the masking challenge `γ` used in the FRI unbatch round
+///
+/// The returned `challenges` begin with `batch_challenge` followed by the `n` MLE-check challenges.
+/// Use [`mlecheck_fri_consistency`] to check the reduced values.
+pub fn verify_mlecheck_basefold_zk<F, MTScheme, Challenger_>(
 	fri_params: &FRIParams<F>,
 	merkle_scheme: &MTScheme,
 	codeword_commitment: MTScheme::Digest,
-	sum_claim: F,
+	eval_claim: F,
+	eval_point: &[F],
+	batch_challenge: F,
 	transcript: &mut VerifierTranscript<Challenger_>,
 ) -> Result<ReducedOutput<F>, Error>
 where
@@ -114,42 +135,37 @@ where
 	Challenger_: Challenger,
 	MTScheme: MerkleTreeScheme<F, Digest: DeserializeBytes>,
 {
-	// The multivariate polynomial evaluated is a degree-2 multilinear composite.
-	const DEGREE: usize = 2;
+	// The MLE-check round polynomial is degree 1 (the composite is the multilinear itself).
+	const DEGREE: usize = 1;
 
 	assert_eq!(fri_params.log_batch_size(), 1); // precondition
 
-	// Read the evaluation claim for the mask from the transcript.
-	let mask_claim = transcript.message().read::<F>()?;
-
 	let n_vars = fri_params.rs_code().log_dim();
+	assert_eq!(eval_point.len(), n_vars);
 	let mut challenges = Vec::with_capacity(n_vars + 1);
 
 	let mut fri_fold_verifier = FRIFoldVerifier::new(fri_params);
 
-	let batch_challenge = transcript.sample();
-
-	// Compute the batched sum using linear interpolation.
-	let mut sum = extrapolate_line_packed(sum_claim, mask_claim, batch_challenge);
-
+	// Unbatch round: the FRI folds the interleaved (π ‖ ω) codeword at the masking challenge.
 	fri_fold_verifier.process_round(&mut transcript.message())?;
 	challenges.push(batch_challenge);
 
-	for _ in 0..n_vars {
-		let round_proof = RoundProof(RoundCoeffs(transcript.message().read_vec(DEGREE)?));
+	let mut sum = eval_claim;
+	for round in 0..n_vars {
+		let round_proof = mlecheck::RoundProof(RoundCoeffs(transcript.message().read_vec(DEGREE)?));
 		fri_fold_verifier.process_round(&mut transcript.message())?;
 
-		let round_coeffs = round_proof.recover(sum);
+		// MLE-check binds variables high-to-low, so round `i` uses coordinate `eval_point[n-1-i]`.
+		let alpha = eval_point[n_vars - 1 - round];
+		let round_coeffs = round_proof.recover(sum, alpha);
 		let challenge = transcript.sample();
 		sum = round_coeffs.evaluate(challenge);
 		challenges.push(challenge);
 	}
 
-	// Finalize and get commitments
 	fri_fold_verifier.process_round(&mut transcript.message())?;
 	let round_commitments = fri_fold_verifier.finalize();
 
-	// TODO: Make all commitments after the first non-hiding
 	let fri_verifier = FRIQueryVerifier::new(
 		fri_params,
 		merkle_scheme,
@@ -197,6 +213,17 @@ pub fn sumcheck_fri_consistency<F: Field>(
 ) -> bool {
 	challenges.reverse();
 	fri_final_oracle * eq_ind(evaluation_point, &challenges) == sumcheck_final_claim
+}
+
+/// Verifies that the final FRI oracle is consistent with the MLE-check from
+/// [`verify_mlecheck_basefold_zk`].
+///
+/// In an MLE-check the equality-indicator factor is folded into the round-proof recovery, so the
+/// final reduced value is the multilinear evaluation `π'(r)` with no extra factor. The final FRI
+/// value is the same `π'(r)`, so consistency is plain equality (contrast
+/// [`sumcheck_fri_consistency`], where the transparent operand contributes an `eq` factor).
+pub fn mlecheck_fri_consistency<F: Field>(fri_final_oracle: F, sumcheck_final_claim: F) -> bool {
+	fri_final_oracle == sumcheck_final_claim
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -30,6 +30,11 @@ pub struct Keccak256 {
 }
 
 impl Keccak256 {
+	/// Returns the padded-message witness wires (filled by [`Self::populate_message`]).
+	pub fn padded_message(&self) -> &[Wire] {
+		&self.padded_message
+	}
+
 	/// Create a new keccak circuit using the circuit builder
 	///
 	/// # Arguments

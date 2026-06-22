@@ -10,6 +10,9 @@
 use cfg_if::cfg_if;
 
 use super::m512::M512;
+// Used by the CLMUL-accelerated `ClMulUnderlier` impl and the `GhashWideMul` alias below.
+#[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
+use crate::arch::x86_64::arithmetic::ghash;
 use crate::{
 	BinaryField128bGhash,
 	arch::portable::packed_macros::{portable_macros::*, *},
@@ -19,9 +22,14 @@ use crate::{
 	},
 	underlier::Divisible,
 };
-// Only used by the CLMUL-accelerated `ClMulUnderlier` and `WideMul` impls below.
+
+/// Widening-multiply wrapper used by the GHASH packing: the reduction-deferring
+/// [`GhashClMulWideMul`](ghash::GhashClMulWideMul) when VPCLMULQDQ + AVX-512 are available,
+/// otherwise an eager [`TrivialWideMul`].
 #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
-use crate::{arch::shared::ghash, arithmetic_traits::WideMul};
+pub type GhashWideMul<T> = ghash::GhashClMulWideMul<T>;
+#[cfg(not(all(target_feature = "vpclmulqdq", target_feature = "avx512f")))]
+pub type GhashWideMul<T> = TrivialWideMul<T>;
 
 #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))]
 impl ghash::ClMulUnderlier for M512 {
@@ -52,7 +60,8 @@ define_packed_binary_field!(
 	M512,
 	(Ghash512Strategy),
 	(Ghash512Strategy),
-	(Ghash512Strategy)
+	(Ghash512Strategy),
+	(GhashWideMul)
 );
 
 // Implement TaggedMul for Ghash512Strategy
@@ -61,7 +70,7 @@ cfg_if! {
 		impl TaggedMul<Ghash512Strategy> for PackedBinaryGhash4x128b {
 			#[inline]
 			fn mul(self, rhs: Self) -> Self {
-				Self::from_underlier(crate::arch::shared::ghash::mul_clmul(
+				Self::from_underlier(crate::arch::x86_64::arithmetic::ghash::mul_clmul(
 					self.to_underlier(),
 					rhs.to_underlier(),
 				))
@@ -120,7 +129,7 @@ cfg_if! {
 		impl TaggedSquare<Ghash512Strategy> for PackedBinaryGhash4x128b {
 			#[inline]
 			fn square(self) -> Self {
-				Self::from_underlier(crate::arch::shared::ghash::square_clmul(
+				Self::from_underlier(crate::arch::x86_64::arithmetic::ghash::square_clmul(
 					self.to_underlier(),
 				))
 			}
@@ -129,27 +138,6 @@ cfg_if! {
 		// Potentially we could use an optimized square implementation here with a scaled underlier.
 		// But this case (an architecture with AVX512 but without VPCLMULQDQ) is pretty rare.
 		impl_square_with!(PackedBinaryGhash4x128b @ crate::arch::ReuseMultiplyStrategy);
-	}
-}
-
-// Implement WideMul
-cfg_if! {
-	if #[cfg(all(target_feature = "vpclmulqdq", target_feature = "avx512f"))] {
-		impl WideMul for PackedBinaryGhash4x128b {
-			type Output = ghash::WideGhashProduct<M512>;
-
-			#[inline]
-			fn wide_mul(a: Self, b: Self) -> Self::Output {
-				ghash::WideGhashProduct::wide_mul(a.to_underlier(), b.to_underlier())
-			}
-
-			#[inline]
-			fn reduce(wide: Self::Output) -> Self {
-				Self::from_underlier(wide.reduce())
-			}
-		}
-	} else {
-		crate::arithmetic_traits::impl_trivial_wide_mul!(PackedBinaryGhash4x128b);
 	}
 }
 

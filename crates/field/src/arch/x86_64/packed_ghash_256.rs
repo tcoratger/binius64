@@ -20,9 +20,6 @@ use crate::{
 		impl_square_with,
 	},
 };
-// Only used by the CLMUL-accelerated `WideMul` impl below.
-#[cfg(target_feature = "vpclmulqdq")]
-use crate::{arch::shared::ghash, arithmetic_traits::WideMul};
 // Only used by the element-wise fallback when VPCLMULQDQ is unavailable.
 #[cfg(not(target_feature = "vpclmulqdq"))]
 use crate::{
@@ -30,10 +27,17 @@ use crate::{
 	underlier::Divisible,
 };
 
+/// Widening-multiply wrapper used by the GHASH packing: the reduction-deferring
+/// `GhashClMulWideMul` when VPCLMULQDQ is available, otherwise an eager `TrivialWideMul`.
+#[cfg(target_feature = "vpclmulqdq")]
+pub type GhashWideMul<T> = crate::arch::x86_64::arithmetic::ghash::GhashClMulWideMul<T>;
+#[cfg(not(target_feature = "vpclmulqdq"))]
+pub type GhashWideMul<T> = TrivialWideMul<T>;
+
 #[cfg(target_feature = "vpclmulqdq")]
 mod vpclmulqdq {
 	use super::*;
-	use crate::arch::shared::ghash::ClMulUnderlier;
+	use crate::arch::x86_64::arithmetic::ghash::ClMulUnderlier;
 
 	impl ClMulUnderlier for M256 {
 		#[inline]
@@ -59,7 +63,8 @@ define_packed_binary_field!(
 	M256,
 	(Ghash256Strategy),
 	(Ghash256Strategy),
-	(Ghash256Strategy)
+	(Ghash256Strategy),
+	(GhashWideMul)
 );
 
 // Implement TaggedMul for Ghash256Strategy
@@ -68,7 +73,7 @@ cfg_if! {
 		impl TaggedMul<Ghash256Strategy> for PackedBinaryGhash2x128b {
 			#[inline]
 			fn mul(self, rhs: Self) -> Self {
-				Self::from_underlier(crate::arch::shared::ghash::mul_clmul(
+				Self::from_underlier(crate::arch::x86_64::arithmetic::ghash::mul_clmul(
 					self.to_underlier(),
 					rhs.to_underlier(),
 				))
@@ -111,7 +116,7 @@ cfg_if! {
 		impl TaggedSquare<Ghash256Strategy> for PackedBinaryGhash2x128b {
 			#[inline]
 			fn square(self) -> Self {
-				Self::from_underlier(crate::arch::shared::ghash::square_clmul(self.to_underlier()))
+				Self::from_underlier(crate::arch::x86_64::arithmetic::ghash::square_clmul(self.to_underlier()))
 			}
 		}
 	} else {
@@ -133,27 +138,6 @@ cfg_if! {
 				Self::from_underlier(result_underlier)
 			}
 		}
-	}
-}
-
-// Implement WideMul
-cfg_if! {
-	if #[cfg(target_feature = "vpclmulqdq")] {
-		impl WideMul for PackedBinaryGhash2x128b {
-			type Output = ghash::WideGhashProduct<M256>;
-
-			#[inline]
-			fn wide_mul(a: Self, b: Self) -> Self::Output {
-				ghash::WideGhashProduct::wide_mul(a.to_underlier(), b.to_underlier())
-			}
-
-			#[inline]
-			fn reduce(wide: Self::Output) -> Self {
-				Self::from_underlier(wide.reduce())
-			}
-		}
-	} else {
-		crate::arithmetic_traits::impl_trivial_wide_mul!(PackedBinaryGhash2x128b);
 	}
 }
 

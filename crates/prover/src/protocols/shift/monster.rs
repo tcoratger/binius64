@@ -6,9 +6,9 @@ use binius_field::{AESTowerField8b, BinaryField, Field, PackedField};
 use binius_math::{
 	BinarySubspace, FieldBuffer, multilinear::eq::eq_ind_partial_eval, univariate::lagrange_evals,
 };
-use binius_utils::{checked_arithmetics::strict_log_2, rayon::prelude::*};
+use binius_utils::{checked_arithmetics::log2_ceil_usize, rayon::prelude::*};
 use binius_verifier::{
-	config::{LOG_WORD_SIZE_BITS, WORD_SIZE_BITS},
+	config::{LOG_WORD_SIZE_BITS, LOG_WORDS_PER_ELEM, WORD_SIZE_BITS},
 	protocols::shift::{BITAND_ARITY, INTMUL_ARITY, evaluate_h_op},
 };
 use bytemuck::zeroed_vec;
@@ -187,12 +187,17 @@ where
 		&intmul_h_ops,
 	);
 
-	let monster_multilinear = key_collection
+	let n_words = key_collection.key_ranges.len();
+	let log_len = log2_ceil_usize(n_words).max(LOG_WORDS_PER_ELEM);
+	let capacity = 1 << log_len.saturating_sub(P::LOG_WIDTH);
+
+	let mut monster_multilinear = Vec::<P>::with_capacity(capacity);
+	key_collection
 		.key_ranges
 		.par_chunks(P::WIDTH)
 		.map(|chunk| {
-			P::from_scalars(chunk.iter().map(|Range { start, end }| {
-				key_collection.keys[*start as usize..*end as usize]
+			P::from_scalars(chunk.iter().map(|&Range { start, end }| {
+				key_collection.keys[start as usize..end as usize]
 					.iter()
 					.map(|key| {
 						let (operator_data, scalars) = match key.operation {
@@ -210,11 +215,10 @@ where
 					.sum()
 			}))
 		})
-		.collect::<Box<[_]>>();
+		.collect_into_vec(&mut monster_multilinear);
+	monster_multilinear.resize(capacity, P::default());
 
-	let log_len = strict_log_2(key_collection.key_ranges.len())
-		.expect("same length as constraint system's `key_ranges`");
-	Ok(FieldBuffer::new(log_len, monster_multilinear))
+	Ok(FieldBuffer::new(log_len, monster_multilinear.into_boxed_slice()))
 }
 
 #[cfg(test)]

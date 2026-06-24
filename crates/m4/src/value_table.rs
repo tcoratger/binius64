@@ -60,8 +60,8 @@ impl ValueTable {
 	/// - `circuit`: the single-instance circuit, evaluated once per instance.
 	/// - `log_instances`: base-2 logarithm of the instance count.
 	/// - `fill`: sets the input wires of instance `i`, for `i` in `0..2^log_instances`. It sets the
-	///   inputs evaluation cannot derive: public inputs/outputs and free witnesses.
-	///   It must assign every input on each call, since the witness vector is reused between instances.
+	///   inputs evaluation cannot derive: public inputs/outputs and free witnesses. It must assign
+	///   every input on each call, since the witness vector is reused between instances.
 	///
 	/// # Errors
 	///
@@ -93,7 +93,8 @@ impl ValueTable {
 		// Populate each instance into its own slice of the buffer, concurrently.
 		// The chunks are disjoint, so the instances never contend for the same words.
 		data.par_chunks_mut(stride).enumerate().try_for_each_init(
-			// A witness vector reused across this thread's instances, including transient scratch space.
+			// A witness vector reused across this thread's instances, including transient scratch
+			// space.
 			|| circuit.new_witness_filler(),
 			|filler, (instance, chunk)| {
 				// The caller assigns this instance's input wires.

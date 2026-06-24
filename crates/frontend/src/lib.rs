@@ -32,7 +32,7 @@ pub mod util;
 
 pub use compiler::{
 	CircuitBuilder, Wire,
-	circuit::{Circuit, WitnessFiller},
+	circuit::{Circuit, PopulateError, WitnessFiller},
 	hints::{self, Hint},
 };
 pub use stat::CircuitStat;

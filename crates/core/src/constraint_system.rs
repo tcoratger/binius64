@@ -84,6 +84,38 @@ pub enum ShiftVariant {
 	Rotr32,
 }
 
+impl ShiftVariant {
+	/// Applies this shift to a 64-bit word and returns the result.
+	///
+	/// The variant selects which word-level operation runs.
+	/// Full-width variants act on the whole 64-bit word.
+	/// The 32-bit variants act on the upper and lower halves independently.
+	///
+	/// # Arguments
+	/// - The word to shift.
+	/// - The shift amount in bits.
+	#[inline]
+	pub fn apply(self, word: Word, amount: usize) -> Word {
+		// The word-level operators take the amount as a 32-bit count.
+		let amount = amount as u32;
+		// Dispatch to the matching operation:
+		// - logical left / logical right shift in zeros.
+		// - arithmetic right replicates the sign bit.
+		// - rotate wraps bits around the word.
+		// - the `*32` family applies the same op to each 32-bit half on its own.
+		match self {
+			ShiftVariant::Sll => word << amount,
+			ShiftVariant::Slr => word >> amount,
+			ShiftVariant::Sar => word.sar(amount),
+			ShiftVariant::Rotr => word.rotr(amount),
+			ShiftVariant::Sll32 => word.sll32(amount),
+			ShiftVariant::Srl32 => word.srl32(amount),
+			ShiftVariant::Sra32 => word.sra32(amount),
+			ShiftVariant::Rotr32 => word.rotr32(amount),
+		}
+	}
+}
+
 impl SerializeBytes for ShiftVariant {
 	fn serialize(&self, write_buf: impl BufMut) -> Result<(), SerializationError> {
 		let index = match self {
@@ -273,6 +305,17 @@ impl ShiftedValueIndex {
 			shift_variant: ShiftVariant::Rotr32,
 			amount,
 		}
+	}
+
+	/// Evaluates this term against a witness.
+	///
+	/// A term names one value and a shift to apply to it.
+	/// It contributes one shifted word to the XOR that forms an operand.
+	#[inline]
+	pub fn eval(&self, witness: &ValueVec) -> Word {
+		// Look up the referenced word, then apply this term's shift.
+		self.shift_variant
+			.apply(witness[self.value_index], self.amount)
 	}
 }
 
@@ -854,6 +897,18 @@ impl ValueVec {
 		let start = 0;
 		let end = self.layout.committed_total_len;
 		&self.data[start..end]
+	}
+
+	/// Evaluates an operand against this witness.
+	///
+	/// An operand is the XOR of its shifted-value terms.
+	/// An empty operand evaluates to the zero word, the XOR identity.
+	#[inline]
+	pub fn eval_operand(&self, operand: &[ShiftedValueIndex]) -> Word {
+		// Fold each shifted term into the running XOR, starting from the identity.
+		operand
+			.iter()
+			.fold(Word::ZERO, |acc, term| acc ^ term.eval(self))
 	}
 }
 

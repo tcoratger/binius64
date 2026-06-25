@@ -2,7 +2,6 @@
 
 use binius_core::{
 	constraint_system::{AndConstraint, ConstraintSystem, MulConstraint, ValueVec},
-	verify::eval_operand,
 	word::Word,
 };
 use binius_field::{
@@ -486,9 +485,9 @@ fn build_bitand_witness(and_constraints: &[AndConstraint], witness: &ValueVec) -
 	(and_constraints, a.spare_capacity_mut(), b.spare_capacity_mut(), c.spare_capacity_mut())
 		.into_par_iter()
 		.for_each(|(constraint, a_i, b_i, c_i)| {
-			a_i.write(eval_operand(witness, &constraint.a));
-			b_i.write(eval_operand(witness, &constraint.b));
-			c_i.write(eval_operand(witness, &constraint.c));
+			a_i.write(witness.eval_operand(&constraint.a));
+			b_i.write(witness.eval_operand(&constraint.b));
+			c_i.write(witness.eval_operand(&constraint.c));
 		});
 
 	// Safety: all entries in a, b, c are initialized in the parallel loop above.
@@ -519,10 +518,10 @@ fn build_intmul_witness(mul_constraints: &[MulConstraint], witness: &ValueVec) -
 	)
 		.into_par_iter()
 		.for_each(|(constraint, a_i, b_i, lo_i, hi_i)| {
-			a_i.write(eval_operand(witness, &constraint.a));
-			b_i.write(eval_operand(witness, &constraint.b));
-			lo_i.write(eval_operand(witness, &constraint.lo));
-			hi_i.write(eval_operand(witness, &constraint.hi));
+			a_i.write(witness.eval_operand(&constraint.a));
+			b_i.write(witness.eval_operand(&constraint.b));
+			lo_i.write(witness.eval_operand(&constraint.lo));
+			hi_i.write(witness.eval_operand(&constraint.hi));
 		});
 
 	// Safety: all entries in a, b, lo, hi are initialized in the parallel loop above.

@@ -8,7 +8,7 @@ use std::{
 	rc::{Rc, Weak},
 };
 
-use binius_field::Field;
+use binius_field::{Field, util::FieldFn};
 use binius_iop::channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec};
 use binius_ip::channel::IPVerifierChannel;
 use binius_spartan_frontend::circuit_builder::{CircuitBuilder, ConstraintBuilder};
@@ -105,16 +105,13 @@ impl<F: Field> IPVerifierChannel<F> for IronSpartanBuilderChannel<F> {
 		}
 	}
 
-	fn compute_public_value(
-		&mut self,
-		_inputs: &[Self::Elem],
-		_f: impl FnOnce(&[F]) -> F,
-	) -> Self::Elem {
-		// The closure is an arbitrary native computation the constraint system cannot replay, so
-		// its result enters as a single inout wire (a public input the verifier supplies), rather
-		// than a sub-circuit's worth of constraints. The value is filled concretely by the
-		// instance/witness channels; symbolically we only allocate the wire.
-		self.alloc_inout_elem()
+	fn compute(&mut self, _inputs: &[Self::Elem], f: impl FieldFn<F>) -> Vec<Self::Elem> {
+		// The function is an arbitrary native computation the constraint system cannot replay.
+		// Each output is reserved as one inout wire, filled concretely by the instance/witness
+		// channels. The function is never run here, so allocate purely by output arity.
+		(0..f.n_outputs())
+			.map(|_| self.alloc_inout_elem())
+			.collect()
 	}
 }
 

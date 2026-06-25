@@ -18,7 +18,7 @@
 
 use std::iter::repeat_with;
 
-use binius_field::{Field, field::FieldOps};
+use binius_field::{Field, field::FieldOps, util::FieldFn};
 use binius_transcript::{
 	VerifierTranscript,
 	fiat_shamir::{CanSample, Challenger},
@@ -84,31 +84,22 @@ pub trait IPVerifierChannel<F: Field> {
 	/// Returns [`Error::InvalidAssert`] if the value is not zero.
 	fn assert_zero(&mut self, val: Self::Elem) -> Result<(), Error>;
 
-	/// Computes a value that is a function of public-channel-derived elements and returns it
-	/// as a freshly allocated `Elem`.
+	/// Computes a function of public-channel-derived elements.
 	///
-	/// In wrapper channels that build constraints (e.g. `IronSpartanBuilderChannel`), the result
-	/// is materialized as a single inout wire holding the closure's return value, replacing what
-	/// would otherwise be a sub-circuit's worth of constraints. In non-wrapper channels where
-	/// `Elem = F`, the impl is just `f(inputs)`.
+	/// Each function output becomes one freshly allocated `Elem`:
+	/// - Non-wrapper channel (`Elem = F`): the result is the function applied to `inputs`.
+	/// - Constraint-building wrapper channel: each output is one inout wire holding the value.
 	///
-	/// The caller MUST ensure each entry in `inputs` is either a `Constant` or a `Wire` whose
-	/// public-tag is true — i.e. produced by `sample_*` / `observe_*` / `compute_public_value`
-	/// on this channel, or derived purely from such values via the channel's `Elem` arithmetic.
-	/// Inputs from `recv_*` (or anything that mixed in a non-public value) MUST NOT be passed.
-	/// The contract is documented; wrapper impls debug-assert it but it is not statically enforced.
+	/// Every entry in `inputs` must be public-derived:
+	/// - a `Constant`, or a `Wire` built only from `sample_*` / `observe_*` / `compute` outputs;
+	/// - never a value from `recv_*`, which carries non-public data.
 	///
-	/// The closure may or may not be invoked: the symbolic-builder channel skips it, and other
-	/// impls run it on either real or dummy values. Callers must therefore supply a pure function
-	/// with no observable side effects.
+	/// Wrapper impls debug-assert this contract; it is not statically enforced.
+	/// The function must be pure: the symbolic builder skips it and allocates `f.n_outputs()`
+	/// wires.
 	///
-	/// HACK: This is a temporary hack to fix a performance regression. This feature should be
-	/// killed and handled more elegantly with better witness generation code.
-	fn compute_public_value(
-		&mut self,
-		inputs: &[Self::Elem],
-		f: impl FnOnce(&[F]) -> F,
-	) -> Self::Elem;
+	/// HACK: materializing native values as inout wires fixes a performance regression.
+	fn compute(&mut self, inputs: &[Self::Elem], f: impl FieldFn<F>) -> Vec<Self::Elem>;
 }
 
 impl<F, Challenger_> IPVerifierChannel<F> for VerifierTranscript<Challenger_>
@@ -154,8 +145,9 @@ where
 		}
 	}
 
-	fn compute_public_value(&mut self, inputs: &[F], f: impl FnOnce(&[F]) -> F) -> F {
-		f(inputs)
+	fn compute(&mut self, inputs: &[F], f: impl FieldFn<F>) -> Vec<F> {
+		// Elem is the field itself, so the outputs need no wrapping.
+		f.call::<F>(inputs)
 	}
 }
 

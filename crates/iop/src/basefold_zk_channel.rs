@@ -8,7 +8,7 @@
 
 use std::iter;
 
-use binius_field::BinaryField;
+use binius_field::{BinaryField, util::FieldFn};
 use binius_ip::{
 	channel::IPVerifierChannel,
 	sumcheck::{self, BatchSumcheckOutput},
@@ -303,8 +303,9 @@ where
 		}
 	}
 
-	fn compute_public_value(&mut self, inputs: &[F], f: impl FnOnce(&[F]) -> F) -> F {
-		f(inputs)
+	fn compute(&mut self, inputs: &[F], f: impl FieldFn<F>) -> Vec<F> {
+		// Elem is the field itself, so the outputs need no wrapping.
+		f.call::<F>(inputs)
 	}
 }
 

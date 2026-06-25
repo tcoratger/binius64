@@ -51,10 +51,7 @@ use binius_transcript::{VerifierTranscript, fiat_shamir::Challenger};
 use binius_utils::{DeserializeBytes, checked_arithmetics::checked_log_2};
 use digest::Output;
 
-use crate::{
-	constraint_system::{BlindingInfo, ConstraintSystemPadded},
-	wiring::evaluate_wiring_mle_public,
-};
+use crate::constraint_system::{BlindingInfo, ConstraintSystemPadded};
 
 pub const SECURITY_BITS: usize = 96;
 
@@ -184,31 +181,18 @@ impl<F: Field> IOPVerifier<F> {
 		// channel never cross a thread boundary.
 		let r_x_tensor: Rc<[Channel::Elem]> = eq_ind_partial_eval_scalars(&r_x).into();
 
-		// The public-segment contribution to the operand evaluations is purely a function of
-		// public-channel inputs (the public scalars, λ, and rₓ). Trade in those Elems for plain
-		// field values, run the MLE evaluation in plaintext, and materialize the result as a
-		// single inout wire instead of building the entire sub-circuit.
+		// The public-segment contribution depends only on public-channel inputs: public scalars, λ,
+		// rₓ. Evaluate the MLE in plaintext and materialize the result as one inout wire, not a
+		// sub-circuit. rₓ's eq-indicator tensor is expanded inside the function, so rₓ is passed
+		// directly.
 		let public_eval = {
-			let public_len = public.len();
-			let inputs = [
-				public.as_slice(),
-				slice::from_ref(&lambda),
-				r_x_tensor.as_ref(),
-			]
-			.concat();
-
-			let mul_constraints = cs.mul_constraints();
-			channel.compute_public_value(&inputs, move |vals| {
-				let public_vals = &vals[..public_len];
-				let lambda_val = vals[public_len];
-				let r_x_tensor_vals = &vals[public_len + 1..];
-				evaluate_wiring_mle_public(
-					mul_constraints,
-					public_vals,
-					lambda_val,
-					r_x_tensor_vals,
-				)
-			})
+			let inputs = [public.as_slice(), slice::from_ref(&lambda), r_x.as_slice()].concat();
+			let f = wiring::PublicWiringEvalFn::new(cs.mul_constraints(), public.len());
+			channel
+				.compute(&inputs, f)
+				.into_iter()
+				.next()
+				.expect("PublicWiringEvalFn produces exactly one output")
 		};
 
 		// Prover sends the precommit segment's contribution to the operand evaluations.

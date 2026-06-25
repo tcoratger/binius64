@@ -4,6 +4,23 @@ use std::iter;
 
 use crate::{Field, field::FieldOps};
 
+/// An arithmetic function over field elements, generic in the field it runs in.
+///
+/// One implementation evaluates in any field `F` whose scalar is the base field `G`:
+/// - natively, in the verifier's own field;
+/// - symbolically, over a circuit-element type that also implements [`FieldOps`].
+///
+/// The output length is fixed and known from [`Self::n_outputs`] without running the function.
+pub trait FieldFn<G: Field> {
+	/// The number of field elements [`Self::call`] returns.
+	///
+	/// A symbolic builder allocates this many output wires without evaluating the function.
+	fn n_outputs(&self) -> usize;
+
+	/// Evaluates the function on `inputs`, returning [`Self::n_outputs`] elements.
+	fn call<F: FieldOps<Scalar = G> + From<G>>(&self, inputs: &[F]) -> Vec<F>;
+}
+
 /// Iterate the powers of a given value, beginning with 1 (the 0'th power).
 pub fn powers<F: FieldOps>(val: F) -> impl Iterator<Item = F> {
 	iter::successors(Some(F::one()), move |power| Some(power.clone() * val.clone()))

@@ -9,7 +9,7 @@ use std::{
 	vec::IntoIter as VecIntoIter,
 };
 
-use binius_field::Field;
+use binius_field::{Field, util::FieldFn};
 use binius_iop::channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec};
 use binius_ip::channel::IPVerifierChannel;
 use binius_spartan_frontend::{
@@ -121,32 +121,27 @@ impl<'a, F: Field> IPVerifierChannel<F> for ReplayChannel<'a, F> {
 		}
 	}
 
-	fn compute_public_value(
-		&mut self,
-		inputs: &[Self::Elem],
-		f: impl FnOnce(&[F]) -> F,
-	) -> Self::Elem {
-		// The closure's result enters as a single inout wire (matching the symbolic builder), whose
-		// value the prover computes natively from the public-derived inputs. See
-		// `IronSpartanBuilderChannel::compute_public_value`.
-		let value = f(&extract_public_values(inputs));
-		let wire = self.inout_alloc.alloc();
-		let witness_wire = self.witness_gen.borrow_mut().write_inout(wire, value);
-		CircuitElem::wire(&self.witness_gen, witness_wire)
-	}
-}
+	fn compute(&mut self, inputs: &[Self::Elem], f: impl FieldFn<F>) -> Vec<Self::Elem> {
+		// The prover knows every wire's value, so read each input directly.
+		// No public-tag check is needed here; the contract is enforced verifier-side.
+		let input_values = inputs
+			.iter()
+			.map(|elem| match elem {
+				CircuitElem::Constant(c) => *c,
+				CircuitElem::Wire { wire, .. } => wire.val(),
+			})
+			.collect::<Vec<F>>();
 
-/// Extracts the concrete field value of each input. The prover knows every wire's value (public or
-/// not), so no public-tag check is needed here — the [`IPVerifierChannel::compute_public_value`]
-/// contract is enforced verifier-side, where non-public inputs are value-less.
-fn extract_public_values<F: Field>(inputs: &[CircuitElem<F, WitnessGenerator<'_, F>>]) -> Vec<F> {
-	inputs
-		.iter()
-		.map(|elem| match elem {
-			CircuitElem::Constant(c) => *c,
-			CircuitElem::Wire { wire, .. } => wire.val(),
-		})
-		.collect()
+		// Each function output enters as one inout wire, matching the symbolic builder.
+		f.call::<F>(&input_values)
+			.into_iter()
+			.map(|value| {
+				let wire = self.inout_alloc.alloc();
+				let witness_wire = self.witness_gen.borrow_mut().write_inout(wire, value);
+				CircuitElem::wire(&self.witness_gen, witness_wire)
+			})
+			.collect()
+	}
 }
 
 impl<'r, 'a, F: Field> IOPVerifierChannel<'r, F> for ReplayChannel<'a, F> {

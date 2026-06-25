@@ -13,7 +13,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use binius_field::{BinaryField, Field};
+use binius_field::{BinaryField, util::FieldFn};
 use binius_iop::{
 	basefold_zk_channel::{BaseFoldZKOracle, BaseFoldZKVerifierChannel},
 	channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec},
@@ -213,16 +213,25 @@ where
 		}
 	}
 
-	fn compute_public_value(
-		&mut self,
-		inputs: &[Self::Elem],
-		f: impl FnOnce(&[F]) -> F,
-	) -> Self::Elem {
-		// The closure's result enters as a single inout wire (matching the symbolic builder), whose
-		// value the verifier computes natively from the public-derived inputs. See
-		// `IronSpartanBuilderChannel::compute_public_value`.
-		let value = f(&extract_public_values(inputs));
-		self.alloc_inout_elem(value)
+	fn compute(&mut self, inputs: &[Self::Elem], f: impl FieldFn<F>) -> Vec<Self::Elem> {
+		// Read each input's concrete value to evaluate the function natively.
+		// A value-less wire means a non-public input was passed, which violates the contract:
+		// panic.
+		let input_values = inputs
+			.iter()
+			.map(|elem| match elem {
+				CircuitElem::Constant(c) => *c,
+				CircuitElem::Wire { wire, .. } => {
+					wire.value().expect("compute: input is not public")
+				}
+			})
+			.collect::<Vec<F>>();
+
+		// Each function output enters as one inout wire, matching the symbolic builder.
+		f.call::<F>(&input_values)
+			.into_iter()
+			.map(|value| self.alloc_inout_elem(value))
+			.collect()
 	}
 }
 
@@ -302,18 +311,4 @@ where
 		}
 		self.inner_channel.verify_oracle_relations(inner_relations)
 	}
-}
-
-/// Extracts the concrete field value of each public-derived input. Panics if any input is not
-/// public (value-less), enforcing the [`IPVerifierChannel::compute_public_value`] contract.
-fn extract_public_values<F: Field>(inputs: &[CircuitElem<F, InstanceGenerator<'_, F>>]) -> Vec<F> {
-	inputs
-		.iter()
-		.map(|elem| match elem {
-			CircuitElem::Constant(c) => *c,
-			CircuitElem::Wire { wire, .. } => wire
-				.value()
-				.expect("compute_public_value: input is not public"),
-		})
-		.collect()
 }

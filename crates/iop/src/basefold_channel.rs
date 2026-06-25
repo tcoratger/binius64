@@ -5,7 +5,7 @@
 //! This module provides [`BaseFoldVerifierChannel`], which implements [`IOPVerifierChannel`] using
 //! FRI commitment and BaseFold opening protocols.
 
-use binius_field::BinaryField;
+use binius_field::{BinaryField, util::FieldFn};
 use binius_ip::channel::IPVerifierChannel;
 use binius_transcript::{
 	VerifierTranscript,
@@ -154,8 +154,9 @@ where
 		}
 	}
 
-	fn compute_public_value(&mut self, inputs: &[F], f: impl FnOnce(&[F]) -> F) -> F {
-		f(inputs)
+	fn compute(&mut self, inputs: &[F], f: impl FieldFn<F>) -> Vec<F> {
+		// Elem is the field itself, so the outputs need no wrapping.
+		f.call::<F>(inputs)
 	}
 }
 

@@ -108,10 +108,13 @@ where
 	let num_relation = y_0.clone() * d_1.clone() + y_1.clone() * d_0.clone();
 	let den_relation = d_0 * d_1;
 	let prod_relation = t_0.clone() * y_0.clone() + t_1.clone() * y_1.clone();
+	// Both fractional-addition relations carry the same eq factor, so factor it out.
+	//
+	//     expected = eq * (num_relation + batch_coeff * den_relation)
+	//              + batch_coeff^2 * prod_relation
 	let batch_coeff_sq = batch_coeff.clone().square();
-	let expected = eq_eval.clone() * num_relation
-		+ batch_coeff * (eq_eval * den_relation)
-		+ batch_coeff_sq * prod_relation;
+	let expected =
+		eq_eval * (num_relation + batch_coeff * den_relation) + batch_coeff_sq * prod_relation;
 	channel
 		.assert_zero(eval - expected)
 		.map_err(|_| VerificationError::FinalLayerMismatch)?;

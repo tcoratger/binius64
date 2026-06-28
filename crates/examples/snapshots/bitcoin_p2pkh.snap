@@ -1,28 +1,28 @@
 bitcoin_p2pkh circuit
 --
 Gates & Instructions
-├─ Number of gates: 168,727
-└─ Number of evaluation instructions: 201,906
+├─ Number of gates: 162,929
+└─ Number of evaluation instructions: 196,108
 
 Constraints
-├─ AND constraints: 148,248 used (56.6% of 2^18)
-│  [▓▓▓▓▓░░░░░] spare: 113,896
+├─ AND constraints: 142,467 used (54.3% of 2^18)
+│  [▓▓▓▓▓░░░░░] spare: 119,677
 ├─ MUL constraints: 15,198 used (92.8% of 2^14)
 │  [▓▓▓▓▓▓▓▓▓░] spare: 1,186
-└─ Distinct value indices: 315,146
-   ├─ Distinct shifted value indices: 146,276
-   └─ Distinct unshifted value indices: 168,870
+└─ Distinct value indices: 309,369
+   ├─ Distinct shifted value indices: 146,275
+   └─ Distinct unshifted value indices: 163,094
 
 Value Vector
-├─ Public Section: 123 used (96.1% of 2^7)
-│  [▓▓▓▓▓▓▓▓▓░] spare: 5
-│  ├─ Constants: 123
+├─ Public Section: 135 used (52.7% of 2^8)
+│  [▓▓▓▓▓░░░░░] spare: 121
+│  ├─ Constants: 135
 │  └─ Inout: 0
-├─ Private Section: 168,751 used (64.4%)
-│  [▓▓▓▓▓▓░░░░] spare: 93,265
+├─ Private Section: 162,970 used (62.2%)
+│  [▓▓▓▓▓▓░░░░] spare: 98,918
 │  ├─ Witness: 9
-│  └─ Internal: 168,742
-├─ Total Committed: 168,874 used (64.4% of 2^18)
-│  [▓▓▓▓▓▓░░░░] spare: 93,270
-└─ Scratch (uncommitted): 137,139
+│  └─ Internal: 162,961
+├─ Total Committed: 163,105 used (62.2% of 2^18)
+│  [▓▓▓▓▓▓░░░░] spare: 99,039
+└─ Scratch (uncommitted): 137,122
 

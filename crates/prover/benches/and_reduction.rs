@@ -3,7 +3,7 @@ use std::{iter, iter::repeat_with};
 
 use binius_core::word::Word;
 use binius_field::{
-	Field, PackedAESBinaryField64x8b, Random,
+	Field, PackedAESBinaryField16x8b, Random,
 	linear_transformation::{
 		BytewiseLookupTransformationFactory, LinearTransformationFactory,
 		OutputWrappingTransformationFactory,
@@ -51,11 +51,11 @@ fn bench(c: &mut Criterion) {
 		.reduce_dim(prover_message_domain.dim() - 1)
 		.isomorphic();
 
-	let ntt_lookup = NTTLookup::<PackedAESBinaryField64x8b>::new(&prover_message_domain);
+	let ntt_lookup = NTTLookup::<PackedAESBinaryField16x8b>::new(&prover_message_domain);
 
 	let mut group = c.benchmark_group("evaluate");
 	group.bench_function("NTT lookup precompute", |bench| {
-		bench.iter(|| NTTLookup::<PackedAESBinaryField64x8b>::new(&prover_message_domain));
+		bench.iter(|| NTTLookup::<PackedAESBinaryField16x8b>::new(&prover_message_domain));
 	});
 
 	group.throughput(Throughput::Elements(1 << log_words));

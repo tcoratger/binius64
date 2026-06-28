@@ -15,7 +15,7 @@ use binius_verifier::{
 };
 use itertools::izip;
 
-use super::ntt_lookup::NTTLookup;
+use super::ntt_lookup::{NTTLookup, PASS_WIDTH};
 
 /// Generates a univariate polynomial for the sumcheck protocol in AND constraint reduction.
 ///
@@ -60,7 +60,7 @@ use super::ntt_lookup::NTTLookup;
 ///
 /// * `F` - The challenge field type (must be a binary field)
 /// * `PNTTDomain` - The packed extension field type for NTT operations (width must equal
-///   `ROWS_PER_HYPERCUBE_VERTEX`)
+///   `PASS_WIDTH`, i.e. one of the `N_LIMBS` limbs that tile the output domain)
 pub fn univariate_round_message_extension_domain<F, PNTTDomain>(
 	log_words: usize,
 	a_words: &[Word],
@@ -77,7 +77,7 @@ where
 	// ideally we would just use PNTTDomain::WIDTH everywhere instead, but since this function only
 	// supports 128b underliers, this is set to a constant. We would need to rethink for support of
 	// multiple underlier sizes
-	assert_eq!(PNTTDomain::WIDTH, ROWS_PER_HYPERCUBE_VERTEX);
+	assert_eq!(PNTTDomain::WIDTH, PASS_WIDTH);
 
 	const N_FIXED_SMALL_CHALLENGES: usize = PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES.len();
 	const N_FIXED_LARGE_CHALLENGES: usize = 4;
@@ -145,22 +145,55 @@ where
 				});
 
 			let mut acc = [F::ZERO; ROWS_PER_HYPERCUBE_VERTEX];
-			for (a_subchunk, b_subchunk, c_subchunk, outer_weight) in
-				izip!(a_subchunks, b_subchunks, c_subchunks, &outer_weight_mul_maps)
-			{
-				let mut summed_ntt = PNTTDomain::zero();
-				for (a_i, b_i, c_i, inner_weight) in
-					izip!(a_subchunk, b_subchunk, c_subchunk, &eq_ind_small)
-				{
-					// Compute the low-degree extension of each column via the lookup table.
-					let [first_col_ntt, second_col_ntt, third_col_ntt] =
-						ntt_lookup.multi_ntt_array([a_i.0, b_i.0, c_i.0]);
 
-					// Compute the weighted composition of the LDE values.
-					summed_ntt += (first_col_ntt * second_col_ntt - third_col_ntt) * inner_weight;
-				}
-				for (acc_i, summed_ntt_i) in iter::zip(&mut acc, summed_ntt.into_iter()) {
-					*acc_i += outer_weight.call(summed_ntt_i);
+			// Walk the 64 output evaluations in 4 passes of 16, one limb per pass.
+			//
+			//     pass 0 → acc[0..16]    reads slab 0 (32 KB)
+			//     pass 1 → acc[16..32]   reads slab 1 (32 KB)
+			//     pass 2 → acc[32..48]   reads slab 2 (32 KB)
+			//     pass 3 → acc[48..64]   reads slab 3 (32 KB)
+			//
+			// Each pass touches only its own slab, so the working set stays in L1.
+			// The total arithmetic and byte traffic match a single full-width pass.
+			for (limb, acc_limb) in acc.chunks_exact_mut(PASS_WIDTH).enumerate() {
+				let table_limb = ntt_lookup.limb(limb);
+
+				// Inner loop reproduces the original per-vertex composition, restricted to one
+				// limb.
+				for (a_subchunk, b_subchunk, c_subchunk, outer_weight) in
+					izip!(a_subchunks, b_subchunks, c_subchunks, &outer_weight_mul_maps)
+				{
+					let mut summed_ntt = PNTTDomain::zero();
+					for (a_i, b_i, c_i, inner_weight) in
+						izip!(a_subchunk, b_subchunk, c_subchunk, &eq_ind_small)
+					{
+						// This limb's low-degree extension of each column.
+						// A word is 8 bytes, and the NTT is linear, so sum the per-byte slabs.
+						let mut first_col_ntt = PNTTDomain::zero();
+						let mut second_col_ntt = PNTTDomain::zero();
+						let mut third_col_ntt = PNTTDomain::zero();
+						// Split each 64-bit word into its 8 bytes, low byte first.
+						let a_bytes = a_i.0.to_le_bytes();
+						let b_bytes = b_i.0.to_le_bytes();
+						let c_bytes = c_i.0.to_le_bytes();
+						for byte_index in 0..ROWS_PER_HYPERCUBE_VERTEX / 8 {
+							// One row of the slab holds the contribution of every value at this
+							// byte.
+							let lookup_byte = &table_limb[byte_index];
+							first_col_ntt += lookup_byte[a_bytes[byte_index] as usize];
+							second_col_ntt += lookup_byte[b_bytes[byte_index] as usize];
+							third_col_ntt += lookup_byte[c_bytes[byte_index] as usize];
+						}
+
+						// Apply the AND constraint a*b - c, weighted by the inner eq-indicator.
+						summed_ntt +=
+							(first_col_ntt * second_col_ntt - third_col_ntt) * inner_weight;
+					}
+					// Lift each evaluation from the 8-bit field up to the challenge field.
+					// The outer weight map fuses the embedding with the eq-indicator multiply.
+					for (acc_i, summed_ntt_i) in iter::zip(&mut *acc_limb, summed_ntt.into_iter()) {
+						*acc_i += outer_weight.call(summed_ntt_i);
+					}
 				}
 			}
 			acc
@@ -245,7 +278,7 @@ mod test {
 	use std::iter::repeat_with;
 
 	use binius_field::{
-		BinaryField128bGhash as B128, Field, PackedAESBinaryField64x8b, Random,
+		BinaryField128bGhash as B128, Field, PackedAESBinaryField16x8b, Random,
 		linear_transformation::{
 			BytewiseLookupTransformationFactory, LinearTransformationFactory,
 			OutputWrappingTransformationFactory,
@@ -301,7 +334,7 @@ mod test {
 		// Agreed-upon proof parameter
 
 		let prover_message_domain = BinarySubspace::with_dim(SKIPPED_VARS + 1);
-		let ntt_lookup = NTTLookup::<PackedAESBinaryField64x8b>::new(&prover_message_domain);
+		let ntt_lookup = NTTLookup::<PackedAESBinaryField16x8b>::new(&prover_message_domain);
 
 		let verifier_message_domain = prover_message_domain.isomorphic::<B128>();
 

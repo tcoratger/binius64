@@ -121,11 +121,15 @@ impl Verifier {
 		// BaseFold reduces to a challenge point `pt`, where this transparent evaluates to eq(point,
 		// pt).
 		let point_at_pt = point.clone();
+
+		// The channel only queues the relation here.
+		// `finish` runs the single combined FRI opening check.
 		channel.verify_oracle_relations([OracleLinearRelation {
 			oracle,
 			transparent: Box::new(move |pt: &[B128]| eq_ind(&point_at_pt, pt)),
 			claim: eval,
 		}])?;
+		channel.finish()?;
 
 		Ok((point, eval))
 	}

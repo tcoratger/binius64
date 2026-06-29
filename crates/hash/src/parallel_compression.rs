@@ -60,11 +60,6 @@ impl<C> ParallelCompressionAdaptor<C> {
 	pub fn new(compression: C) -> Self {
 		Self { compression }
 	}
-
-	/// Returns a reference to the underlying compression function.
-	pub fn compression(&self) -> &C {
-		&self.compression
-	}
 }
 
 impl<T, C, const ARITY: usize> ParallelPseudoCompression<T, ARITY> for ParallelCompressionAdaptor<C>

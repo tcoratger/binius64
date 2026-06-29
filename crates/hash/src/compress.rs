@@ -9,14 +9,10 @@
 //!
 //! [Plonky3]: <https://github.com/plonky3/plonky3>
 
-/// An `N`-to-1 compression function, collision-resistant in a hash tree setting.
+/// An `N`-to-1 compression function, collision-resistant in a hash-tree setting.
 ///
-/// Unlike `CompressionFunction`, it may not be collision-resistant in general.
-/// Instead it is only collision-resistant in hash-tree like settings where
-/// the preimage of a non-leaf node must consist of compression outputs.
+/// - It is not assumed collision-resistant for arbitrary inputs.
+/// - Collision resistance holds only where every preimage is itself a compression output.
 pub trait PseudoCompressionFunction<T, const N: usize>: Clone {
 	fn compress(&self, input: [T; N]) -> T;
 }
-
-/// An `N`-to-1 compression function.
-pub trait CompressionFunction<T, const N: usize>: PseudoCompressionFunction<T, N> {}

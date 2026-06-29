@@ -39,7 +39,7 @@ use binius_field::{BinaryField, Field, field::FieldOps};
 use binius_hash::binary_merkle_tree::HashSuite;
 use binius_iop::{
 	basefold,
-	basefold_compiler::BaseFoldZKVerifierCompiler,
+	basefold_compiler::BaseFoldVerifierCompiler,
 	channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec},
 	fri::{self, MinProofSizeStrategy},
 	merkle_tree::BinaryMerkleTreeScheme,
@@ -51,7 +51,10 @@ use binius_transcript::{VerifierTranscript, fiat_shamir::Challenger};
 use binius_utils::{DeserializeBytes, checked_arithmetics::checked_log_2};
 use digest::Output;
 
-use crate::constraint_system::{BlindingInfo, ConstraintSystemPadded};
+use crate::{
+	constraint_system::{BlindingInfo, ConstraintSystemPadded},
+	wiring::evaluate_wiring_mle_public,
+};
 
 pub const SECURITY_BITS: usize = 96;
 
@@ -92,7 +95,7 @@ where
 {
 	iop_verifier: IOPVerifier<F>,
 	/// BaseFold ZK compiler for creating verifier channels.
-	basefold_compiler: BaseFoldZKVerifierCompiler<F, BinaryMerkleTreeScheme<F, H>>,
+	basefold_compiler: BaseFoldVerifierCompiler<F, BinaryMerkleTreeScheme<F, H>>,
 }
 
 impl<F: Field> IOPVerifier<F> {
@@ -181,18 +184,31 @@ impl<F: Field> IOPVerifier<F> {
 		// channel never cross a thread boundary.
 		let r_x_tensor: Rc<[Channel::Elem]> = eq_ind_partial_eval_scalars(&r_x).into();
 
-		// The public-segment contribution depends only on public-channel inputs: public scalars, λ,
-		// rₓ. Evaluate the MLE in plaintext and materialize the result as one inout wire, not a
-		// sub-circuit. rₓ's eq-indicator tensor is expanded inside the function, so rₓ is passed
-		// directly.
+		// The public-segment contribution to the operand evaluations is purely a function of
+		// public-channel inputs (the public scalars, λ, and rₓ). Trade in those Elems for plain
+		// field values, run the MLE evaluation in plaintext, and materialize the result as a
+		// single inout wire instead of building the entire sub-circuit.
 		let public_eval = {
-			let inputs = [public.as_slice(), slice::from_ref(&lambda), r_x.as_slice()].concat();
-			let f = wiring::PublicWiringEvalFn::new(cs.mul_constraints(), public.len());
-			channel
-				.compute(&inputs, f)
-				.into_iter()
-				.next()
-				.expect("PublicWiringEvalFn produces exactly one output")
+			let public_len = public.len();
+			let inputs = [
+				public.as_slice(),
+				slice::from_ref(&lambda),
+				r_x_tensor.as_ref(),
+			]
+			.concat();
+
+			let mul_constraints = cs.mul_constraints();
+			channel.compute_public_value(&inputs, move |vals| {
+				let public_vals = &vals[..public_len];
+				let lambda_val = vals[public_len];
+				let r_x_tensor_vals = &vals[public_len + 1..];
+				evaluate_wiring_mle_public(
+					mul_constraints,
+					public_vals,
+					lambda_val,
+					r_x_tensor_vals,
+				)
+			})
 		};
 
 		// Prover sends the precommit segment's contribution to the operand evaluations.
@@ -262,7 +278,7 @@ where
 		let merkle_scheme = BinaryMerkleTreeScheme::<F, H>::new();
 
 		// Create the BaseFold ZK compiler for IOP verification
-		let basefold_compiler = BaseFoldZKVerifierCompiler::new(
+		let basefold_compiler = BaseFoldVerifierCompiler::new(
 			merkle_scheme,
 			oracle_specs,
 			log_inv_rate,
@@ -286,7 +302,7 @@ where
 	}
 
 	/// Returns a reference to the BaseFold ZK verifier compiler.
-	pub fn iop_compiler(&self) -> &BaseFoldZKVerifierCompiler<F, BinaryMerkleTreeScheme<F, H>> {
+	pub fn iop_compiler(&self) -> &BaseFoldVerifierCompiler<F, BinaryMerkleTreeScheme<F, H>> {
 		&self.basefold_compiler
 	}
 

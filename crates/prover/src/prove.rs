@@ -6,8 +6,7 @@ use binius_core::{
 	word::Word,
 };
 use binius_field::{
-	AESTowerField8b as B8, BinaryField, ExtensionField, PackedAESBinaryField16x8b, PackedExtension,
-	PackedField,
+	AESTowerField8b as B8, BinaryField, ExtensionField, PackedExtension, PackedField,
 };
 use binius_hash::binary_merkle_tree::HashSuite;
 use binius_iop_prover::{
@@ -31,6 +30,7 @@ use binius_verifier::{
 	protocols::{bitand::AndCheckOutput, intmul::IntMulOutput, sumcheck::SumcheckOutput},
 };
 use digest::Output;
+use rand::{SeedableRng, rngs::StdRng};
 
 use super::error::Error;
 use crate::{
@@ -340,8 +340,12 @@ where
 		)
 		.entered();
 
-		// Create channel and delegate to IOPProver::prove
-		let channel = BaseFoldProverChannel::from_compiler(&self.basefold_compiler, transcript);
+		// Create channel and delegate to IOPProver::prove. The unified channel takes an rng to
+		// mask ZK oracles, but a plain `Prover` produces a transparent proof whose only oracle is
+		// non-ZK, so no masks are drawn and the rng is never consumed.
+		let rng = StdRng::seed_from_u64(0);
+		let channel =
+			BaseFoldProverChannel::from_compiler(&self.basefold_compiler, transcript, rng);
 		self.iop_prover.prove::<P, _>(witness, channel)
 	}
 }
@@ -367,7 +371,24 @@ fn compute_batched_transparent<P: PackedField<Scalar = B128>>(
 	rs_eq_ind
 }
 
-fn pack_witness<P: PackedField<Scalar = B128>>(
+/// Packs committed witness words into the field buffer committed as the trace oracle.
+///
+/// Two 64-bit words are packed little-endian into one 128-bit field element.
+/// The element sequence is zero-padded up to `2^log_witness_elems`.
+///
+/// # Arguments
+///
+/// - `log_witness_elems`: base-2 logarithm of the committed field-element count.
+/// - `witness`: the committed witness words, in value-vector order.
+///
+/// # Returns
+///
+/// The packed multilinear over `log_witness_elems` variables, ready to commit.
+///
+/// # Errors
+///
+/// Returns an error when the words do not fit in `2^log_witness_elems` field elements.
+pub fn pack_witness<P: PackedField<Scalar = B128>>(
 	log_witness_elems: usize,
 	witness: &[Word],
 ) -> Result<FieldBuffer<P>, Error> {
@@ -420,18 +441,16 @@ where
 
 	let log_constraint_count = checked_log_2(a.len());
 
-	let mut small_field_zerocheck_challenges = PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES.to_vec();
-	small_field_zerocheck_challenges.truncate(log_constraint_count);
+	let n_extra_zerocheck_challenges =
+		log_constraint_count.saturating_sub(PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES.len());
+	let big_field_zerocheck_challenges = channel.sample_many(n_extra_zerocheck_challenges);
 
-	let big_field_zerocheck_challenges =
-		channel.sample_many(log_constraint_count - small_field_zerocheck_challenges.len());
-
-	let prover = OblongZerocheckProver::<_, PackedAESBinaryField16x8b, PChallenge>::new(
+	let prover = OblongZerocheckProver::<_, PChallenge>::new(
+		log_constraint_count,
 		a,
 		b,
 		c,
 		big_field_zerocheck_challenges,
-		small_field_zerocheck_challenges,
 		prover_message_domain.isomorphic(),
 	);
 

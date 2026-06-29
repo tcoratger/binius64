@@ -2,7 +2,7 @@
 
 //! ZK-wrapped verifier channel that delegates to a BaseFold ZK channel and an outer IOP verifier.
 //!
-//! [`ZKWrappedVerifierChannel`] wraps a [`BaseFoldZKVerifierChannel`] and an [`IOPVerifier`].
+//! [`ZKWrappedVerifierChannel`] wraps a [`BaseFoldVerifierChannel`] and an [`IOPVerifier`].
 //! Inner-channel values flow through the wrapper as `CircuitElem`s backed by an
 //! [`InstanceGenerator`], which reconstructs the outer constraint system's public-input vector
 //! `[constants | inout | derived]` exactly as the prover's witness generator does — public-derived
@@ -13,15 +13,15 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use binius_field::{BinaryField, util::FieldFn};
+use binius_field::BinaryField;
 use binius_iop::{
-	basefold_zk_channel::{BaseFoldZKOracle, BaseFoldZKVerifierChannel},
+	basefold_channel::{BaseFoldOracle, BaseFoldVerifierChannel},
 	channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec},
 	merkle_tree::MerkleTreeScheme,
 };
 use binius_ip::channel::IPVerifierChannel;
 use binius_spartan_frontend::{
-	circuit_builder::{InstanceGenerator, WireAllocator},
+	circuit_builder::{CircuitBuilder, InstanceGenerator, WireAllocator},
 	constraint_system::{WireKind, WitnessLayout},
 };
 use binius_transcript::fiat_shamir::Challenger;
@@ -29,7 +29,7 @@ use binius_utils::DeserializeBytes;
 
 use crate::{Error, IOPVerifier, wrapper::circuit_elem::CircuitElem};
 
-/// A verifier channel that wraps a [`BaseFoldZKVerifierChannel`] and an [`IOPVerifier`].
+/// A verifier channel that wraps a [`BaseFoldVerifierChannel`] and an [`IOPVerifier`].
 ///
 /// `Self::Elem = CircuitElem<F, InstanceGenerator>`. F values received or sampled from the inner
 /// channel are written into the [`InstanceGenerator`]'s public segment as inout wires (in the same
@@ -47,9 +47,9 @@ where
 	MTScheme: MerkleTreeScheme<F>,
 	Challenger_: Challenger,
 {
-	inner_channel: BaseFoldZKVerifierChannel<'a, F, MTScheme, Challenger_>,
+	inner_channel: BaseFoldVerifierChannel<'a, F, MTScheme, Challenger_>,
 	outer_verifier: &'a IOPVerifier<F>,
-	precommit_oracle: BaseFoldZKOracle,
+	precommit_oracle: BaseFoldOracle,
 	/// Reconstructs the outer public-input vector as the channel replays the inner verifier;
 	/// `build()` yields the `[constants | inout | derived]` segment for the outer verify.
 	instance_gen: Rc<RefCell<InstanceGenerator<'a, F>>>,
@@ -87,7 +87,7 @@ where
 	/// Panics if the channel's oracle specs do not match the expected layout
 	/// `[outer_precommit, inner..., outer_private, outer_mask]`.
 	pub fn new(
-		mut inner_channel: BaseFoldZKVerifierChannel<'a, F, MTScheme, Challenger_>,
+		mut inner_channel: BaseFoldVerifierChannel<'a, F, MTScheme, Challenger_>,
 		outer_verifier: &'a IOPVerifier<F>,
 		outer_layout: &'a WitnessLayout<F>,
 	) -> Result<Self, Error> {
@@ -213,25 +213,23 @@ where
 		}
 	}
 
-	fn compute(&mut self, inputs: &[Self::Elem], f: impl FieldFn<F>) -> Vec<Self::Elem> {
-		// Read each input's concrete value to evaluate the function natively.
-		// A value-less wire means a non-public input was passed, which violates the contract:
-		// panic.
-		let input_values = inputs
-			.iter()
-			.map(|elem| match elem {
-				CircuitElem::Constant(c) => *c,
-				CircuitElem::Wire { wire, .. } => {
-					wire.value().expect("compute: input is not public")
-				}
-			})
-			.collect::<Vec<F>>();
-
-		// Each function output enters as one inout wire, matching the symbolic builder.
-		f.call::<F>(&input_values)
-			.into_iter()
-			.map(|value| self.alloc_inout_elem(value))
-			.collect()
+	fn compute_public_value(
+		&mut self,
+		inputs: &[Self::Elem],
+		f: impl FnOnce(&[F]) -> F,
+	) -> Self::Elem {
+		// The closure's result enters as a single derived public wire (matching the symbolic
+		// builder's `hint_varsize`), whose value the verifier computes natively from the
+		// public-derived inputs. See `IronSpartanBuilderChannel::compute_public_value`.
+		let out_wire = {
+			let mut instance_gen = self.instance_gen.borrow_mut();
+			let input_wires: Vec<_> = inputs
+				.iter()
+				.map(|elem| elem.to_wire(&mut instance_gen))
+				.collect();
+			instance_gen.hint_varsize(&input_wires, 1, move |vals| vec![f(vals)])[0]
+		};
+		CircuitElem::wire(&self.instance_gen, out_wire)
 	}
 }
 
@@ -242,7 +240,7 @@ where
 	MTScheme: MerkleTreeScheme<F, Digest: DeserializeBytes>,
 	Challenger_: Challenger,
 {
-	type Oracle = BaseFoldZKOracle;
+	type Oracle = BaseFoldOracle;
 
 	fn remaining_oracle_specs(&self) -> &[OracleSpec] {
 		let all = self.inner_channel.remaining_oracle_specs();

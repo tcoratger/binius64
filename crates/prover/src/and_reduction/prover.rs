@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use binius_core::word::Word;
 use binius_field::{
-	BinaryField, Field, PackedBinaryField128x1b, PackedExtension, PackedField,
+	AESTowerField8b as B8, BinaryField, PackedField,
 	linear_transformation::{
 		BytewiseLookupTransformationFactory, LinearTransformationFactory,
 		OutputWrappingTransformationFactory,
@@ -12,15 +12,14 @@ use binius_field::{
 use binius_ip_prover::channel::IPProverChannel;
 use binius_math::{
 	BinarySubspace,
-	multilinear::eq::eq_ind_partial_eval,
 	univariate::{extrapolate_over_subspace, lagrange_evals_scalars},
 };
 use binius_verifier::{
-	config::B1,
+	config::PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES,
 	protocols::bitand::{AndCheckOutput, ROWS_PER_HYPERCUBE_VERTEX},
 };
 
-use super::{prover_setup::ntt_lookup_from_prover_message_domain, sumcheck_round_messages};
+use super::sumcheck_round_messages;
 use crate::{
 	fold_word::fold_words_with_transform,
 	protocols::sumcheck::{
@@ -36,28 +35,24 @@ use crate::{
 /// The type parameter `PChallenge` is the packed field over the challenge field `FChallenge` used
 /// for the multilinear sumcheck rounds that follow the univariate round. Packing these rounds over
 /// a wide field provides SIMD acceleration.
-pub struct OblongZerocheckProver<FChallenge, PNTTDomain, PChallenge>
+pub struct OblongZerocheckProver<FChallenge, PChallenge>
 where
-	FChallenge: Field + From<PNTTDomain::Scalar> + BinaryField,
-	PNTTDomain: PackedField,
-	PChallenge: PackedField<Scalar = FChallenge>,
+	FChallenge: BinaryField,
 {
+	log_words: usize,
 	first_col: Vec<Word>,
 	second_col: Vec<Word>,
 	third_col: Vec<Word>,
 	big_field_zerocheck_challenges: Vec<FChallenge>,
-	small_field_zerocheck_challenges: Vec<PNTTDomain::Scalar>,
 	univariate_round_message: [FChallenge; ROWS_PER_HYPERCUBE_VERTEX],
 	univariate_round_message_domain: BinarySubspace<FChallenge>,
 	_marker: PhantomData<PChallenge>,
 }
 
-impl<FChallenge, PNTTDomain, PChallenge> OblongZerocheckProver<FChallenge, PNTTDomain, PChallenge>
+impl<F, PChallenge> OblongZerocheckProver<F, PChallenge>
 where
-	FChallenge: Field + From<PNTTDomain::Scalar> + BinaryField,
-	PNTTDomain: PackedField + PackedExtension<B1, PackedSubfield = PackedBinaryField128x1b>,
-	PNTTDomain::Scalar: BinaryField,
-	PChallenge: PackedField<Scalar = FChallenge>,
+	F: BinaryField + From<B8>,
+	PChallenge: PackedField<Scalar = F>,
 {
 	/// Creates a new oblong zerocheck prover for AND constraint reduction.
 	///
@@ -67,15 +62,12 @@ where
 	///
 	/// # Arguments
 	///
+	/// * `log_words` - Base-2 logarithm of the number of words in each column
 	/// * `first_col` - The oblong multilinear polynomial A in the AND constraint A & B ^ C = 0
 	/// * `second_col` - The oblong multilinear polynomial B in the AND constraint
 	/// * `third_col` - The oblong multilinear polynomial C in the AND constraint
 	/// * `big_field_zerocheck_challenges` - Challenges Z_{k+1},...,Zₙ in the large field FChallenge
-	/// * `ntt_lookup` - Precomputed NTT lookup table for efficient polynomial evaluation
-	/// * `small_field_zerocheck_challenges` - Challenges Z₁,...,Zₖ in the small field (at most 3
-	///   challenges since we use an 8-bit subfield and require F₂-linear independence of all subset
-	///   products)
-	/// * `univariate_round_message_domain` - The domain for evaluating the univariate polynomial
+	/// * `prover_message_domain` - The domain for evaluating the univariate polynomial
 	///
 	/// # Implementation Details
 	///
@@ -85,35 +77,30 @@ where
 	/// 3. Caches these evaluations for later use in the execute() method
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
+		log_words: usize,
 		first_col: Vec<Word>,
 		second_col: Vec<Word>,
 		third_col: Vec<Word>,
-		big_field_zerocheck_challenges: Vec<FChallenge>,
-		small_field_zerocheck_challenges: Vec<PNTTDomain::Scalar>,
-		prover_message_domain: BinarySubspace<PNTTDomain::Scalar>,
+		big_field_zerocheck_challenges: Vec<F>,
+		prover_message_domain: BinarySubspace<B8>,
 	) -> Self {
-		let ntt_lookup = tracing::debug_span!("Compute univariate LDE table").in_scope(|| {
-			ntt_lookup_from_prover_message_domain::<PNTTDomain>(prover_message_domain.clone())
-		});
-		let eq_ind_big_field_challenges = eq_ind_partial_eval(&big_field_zerocheck_challenges);
-
 		let univariate_round_message = tracing::debug_span!("Compute univariate round message")
 			.in_scope(|| {
-				sumcheck_round_messages::univariate_round_message_extension_domain(
+				sumcheck_round_messages::univariate_round_message_extension_domain::<F>(
+					log_words,
 					&first_col,
 					&second_col,
 					&third_col,
-					&eq_ind_big_field_challenges,
-					&ntt_lookup,
-					&small_field_zerocheck_challenges,
+					&big_field_zerocheck_challenges,
+					&prover_message_domain,
 				)
 			});
 
 		Self {
+			log_words,
 			first_col,
 			second_col,
 			third_col,
-			small_field_zerocheck_challenges,
 			univariate_round_message,
 			big_field_zerocheck_challenges,
 			univariate_round_message_domain: prover_message_domain.isomorphic(),
@@ -138,7 +125,7 @@ where
 	///
 	/// The polynomial evaluations are precomputed in the constructor using the NTT lookup table
 	/// for efficiency. This method simply returns the cached result.
-	pub fn execute(&self) -> &[FChallenge; ROWS_PER_HYPERCUBE_VERTEX] {
+	pub fn execute(&self) -> &[F; ROWS_PER_HYPERCUBE_VERTEX] {
 		&self.univariate_round_message
 	}
 
@@ -170,9 +157,9 @@ where
 	/// 5. Constructs the AND reduction sumcheck prover with the folded multilinears
 	pub fn fold_and_send_reduced_prover(
 		self,
-		round_message_domain: BinarySubspace<FChallenge>,
-		challenge: FChallenge,
-	) -> impl MleCheckProver<FChallenge> {
+		round_message_domain: BinarySubspace<F>,
+		challenge: F,
+	) -> impl MleCheckProver<F> {
 		let univariate_domain = round_message_domain.reduce_dim(round_message_domain.dim() - 1);
 		let lagrange_evals = lagrange_evals_scalars(&univariate_domain, challenge);
 		let transform =
@@ -182,19 +169,17 @@ where
 		let proving_polys = [&self.first_col, &self.second_col, &self.third_col]
 			.map(|col| fold_words_with_transform::<_, PChallenge, _>(&transform, col));
 
-		let upcasted_small_field_challenges: Vec<_> = self
-			.small_field_zerocheck_challenges
-			.into_iter()
-			.map(|i| FChallenge::from(i))
-			.collect();
-
-		let verifier_field_zerocheck_challenges: Vec<_> = upcasted_small_field_challenges
+		let upcasted_small_field_challenges = PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES
 			.iter()
-			.chain(self.big_field_zerocheck_challenges.iter())
 			.copied()
-			.collect();
+			.take(self.log_words)
+			.map(F::from);
 
-		let mut first_round_message_coeffs = vec![FChallenge::ZERO; 2 * ROWS_PER_HYPERCUBE_VERTEX];
+		let verifier_field_zerocheck_challenges = upcasted_small_field_challenges
+			.chain(self.big_field_zerocheck_challenges)
+			.collect::<Vec<_>>();
+
+		let mut first_round_message_coeffs = vec![F::ZERO; 2 * ROWS_PER_HYPERCUBE_VERTEX];
 
 		first_round_message_coeffs[ROWS_PER_HYPERCUBE_VERTEX..2 * ROWS_PER_HYPERCUBE_VERTEX]
 			.copy_from_slice(&self.univariate_round_message);
@@ -243,8 +228,8 @@ where
 	/// 4. **Phase 2**: Execute sumcheck protocol on folded multilinears
 	pub fn prove_with_channel(
 		self,
-		channel: &mut impl IPProverChannel<FChallenge>,
-	) -> Result<AndCheckOutput<FChallenge>, Error> {
+		channel: &mut impl IPProverChannel<F>,
+	) -> Result<AndCheckOutput<F>, Error> {
 		let univariate_message_coeffs = self.execute();
 
 		channel.send_many(univariate_message_coeffs);
@@ -285,7 +270,7 @@ mod test {
 
 	use binius_core::word::Word;
 	use binius_field::{
-		AESTowerField8b, PackedAESBinaryField16x8b,
+		AESTowerField8b,
 		arch::OptimalPackedB128,
 		linear_transformation::{
 			BytewiseLookupTransformationFactory, LinearTransformationFactory,
@@ -298,7 +283,7 @@ mod test {
 	};
 	use binius_transcript::{ProverTranscript, fiat_shamir::CanSample};
 	use binius_verifier::{
-		config::{B128, StdChallenger},
+		config::{B128, PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES, StdChallenger},
 		protocols::bitand::{AndCheckOutput, SKIPPED_VARS, verify_with_channel},
 	};
 	use rand::prelude::*;
@@ -315,7 +300,7 @@ mod test {
 	#[test]
 	fn test_transcript_prover_verifies() {
 		let mut prover_challenger = ProverTranscript::new(StdChallenger::default());
-		let log_num_rows = 10;
+		let log_num_rows = 6;
 		let mut rng = StdRng::seed_from_u64(0);
 
 		let small_field_zerocheck_challenges = [
@@ -323,8 +308,8 @@ mod test {
 			AESTowerField8b::new(4),
 			AESTowerField8b::new(16),
 		];
-		let first_mlv = random_words(log_num_rows - SKIPPED_VARS, &mut rng);
-		let second_mlv = random_words(log_num_rows - SKIPPED_VARS, &mut rng);
+		let first_mlv = random_words(log_num_rows, &mut rng);
+		let second_mlv = random_words(log_num_rows, &mut rng);
 		let third_mlv: Vec<Word> = iter::zip(&first_mlv, &second_mlv)
 			.map(|(&a, &b)| a & b)
 			.collect();
@@ -334,14 +319,14 @@ mod test {
 		let verifier_message_domain = prover_message_domain.isomorphic();
 
 		// Prover is instantiated
-		let big_field_zerocheck_challenges =
-			prover_challenger.sample_vec(log_num_rows - SKIPPED_VARS - 3);
-		let prover = OblongZerocheckProver::<_, PackedAESBinaryField16x8b, OptimalPackedB128>::new(
+		let big_field_zerocheck_challenges = prover_challenger
+			.sample_vec(log_num_rows - PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES.len());
+		let prover = OblongZerocheckProver::<_, OptimalPackedB128>::new(
+			log_num_rows,
 			first_mlv.clone(),
 			second_mlv.clone(),
 			third_mlv.clone(),
 			big_field_zerocheck_challenges.to_vec(),
-			small_field_zerocheck_challenges.to_vec(),
 			prover_message_domain.clone(),
 		);
 
@@ -350,8 +335,7 @@ mod test {
 		// Verifier is instantiated
 		let mut verifier_challenger = prover_challenger.into_verifier();
 
-		let big_field_zerocheck_challenges =
-			verifier_challenger.sample_vec(log_num_rows - SKIPPED_VARS - 3);
+		let big_field_zerocheck_challenges = verifier_challenger.sample_vec(log_num_rows - 3);
 
 		let mut all_zerocheck_challenges = vec![];
 

@@ -2,24 +2,7 @@
 
 use std::iter;
 
-use crate::{Field, field::FieldOps};
-
-/// An arithmetic function over field elements, generic in the field it runs in.
-///
-/// One implementation evaluates in any field `F` whose scalar is the base field `G`:
-/// - natively, in the verifier's own field;
-/// - symbolically, over a circuit-element type that also implements [`FieldOps`].
-///
-/// The output length is fixed and known from [`Self::n_outputs`] without running the function.
-pub trait FieldFn<G: Field> {
-	/// The number of field elements [`Self::call`] returns.
-	///
-	/// A symbolic builder allocates this many output wires without evaluating the function.
-	fn n_outputs(&self) -> usize;
-
-	/// Evaluates the function on `inputs`, returning [`Self::n_outputs`] elements.
-	fn call<F: FieldOps<Scalar = G> + From<G>>(&self, inputs: &[F]) -> Vec<F>;
-}
+use crate::{Field, PackedField, field::FieldOps};
 
 /// Iterate the powers of a given value, beginning with 1 (the 0'th power).
 pub fn powers<F: FieldOps>(val: F) -> impl Iterator<Item = F> {
@@ -60,12 +43,12 @@ pub fn powers<F: FieldOps>(val: F) -> impl Iterator<Item = F> {
 /// let sums = expand_subset_sums_array(input);
 /// // sums = [F::ZERO, F::ONE, F::from(2), F::from(3)]
 /// ```
-pub fn expand_subset_sums_array<F: Field, const N: usize, const N_EXP2: usize>(
-	elems: [F; N],
-) -> [F; N_EXP2] {
+pub fn expand_subset_sums_array<P: PackedField, const N: usize, const N_EXP2: usize>(
+	elems: [P; N],
+) -> [P; N_EXP2] {
 	assert_eq!(N_EXP2, 1 << N);
 
-	let mut expanded = [F::ZERO; N_EXP2];
+	let mut expanded = [P::zero(); N_EXP2];
 	for (i, elem_i) in elems.into_iter().enumerate() {
 		let span = &mut expanded[..1 << (i + 1)];
 		let (lo_half, hi_half) = span.split_at_mut(1 << i);
@@ -129,7 +112,7 @@ mod tests {
 		let power_values: Vec<_> = powers(generator).take(10).collect();
 
 		for i in 0..10 {
-			assert_eq!(power_values[i], generator.pow([i as u64]));
+			assert_eq!(power_values[i], generator.pow(i as u64));
 		}
 	}
 

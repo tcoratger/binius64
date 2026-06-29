@@ -9,7 +9,7 @@ use std::{
 	vec::IntoIter as VecIntoIter,
 };
 
-use binius_field::{Field, util::FieldFn};
+use binius_field::Field;
 use binius_iop::channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec};
 use binius_ip::channel::IPVerifierChannel;
 use binius_spartan_frontend::{
@@ -121,26 +121,23 @@ impl<'a, F: Field> IPVerifierChannel<F> for ReplayChannel<'a, F> {
 		}
 	}
 
-	fn compute(&mut self, inputs: &[Self::Elem], f: impl FieldFn<F>) -> Vec<Self::Elem> {
-		// The prover knows every wire's value, so read each input directly.
-		// No public-tag check is needed here; the contract is enforced verifier-side.
-		let input_values = inputs
-			.iter()
-			.map(|elem| match elem {
-				CircuitElem::Constant(c) => *c,
-				CircuitElem::Wire { wire, .. } => wire.val(),
-			})
-			.collect::<Vec<F>>();
-
-		// Each function output enters as one inout wire, matching the symbolic builder.
-		f.call::<F>(&input_values)
-			.into_iter()
-			.map(|value| {
-				let wire = self.inout_alloc.alloc();
-				let witness_wire = self.witness_gen.borrow_mut().write_inout(wire, value);
-				CircuitElem::wire(&self.witness_gen, witness_wire)
-			})
-			.collect()
+	fn compute_public_value(
+		&mut self,
+		inputs: &[Self::Elem],
+		f: impl FnOnce(&[F]) -> F,
+	) -> Self::Elem {
+		// The closure's result enters as a single derived public wire (matching the symbolic
+		// builder's `hint_varsize`), whose value the prover computes natively from the
+		// public-derived inputs. See `IronSpartanBuilderChannel::compute_public_value`.
+		let out_wire = {
+			let mut witness_gen = self.witness_gen.borrow_mut();
+			let input_wires: Vec<_> = inputs
+				.iter()
+				.map(|elem| elem.to_wire(&mut witness_gen))
+				.collect();
+			witness_gen.hint_varsize(&input_wires, 1, move |vals| vec![f(vals)])[0]
+		};
+		CircuitElem::wire(&self.witness_gen, out_wire)
 	}
 }
 

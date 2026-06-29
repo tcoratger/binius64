@@ -1,25 +1,8 @@
 // Copyright 2024-2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
-use super::m128::M128;
-use crate::{
-	arch::{
-		ElementwiseWideMul, MulFromWideMul, PairwiseTableStrategy,
-		portable::packed_macros::{portable_macros::*, *},
-	},
-	arithmetic_traits::{impl_invert_with, impl_mul_with, impl_square_with},
-};
-
-define_packed_binary_fields!(
-	underlier: M128,
-	packed_fields: [
-		packed_field {
-			name: PackedAESBinaryField16x8b,
-			scalar: AESTowerField8b,
-			mul: (MulFromWideMul),
-			square: (PairwiseTableStrategy),
-			invert: (PairwiseTableStrategy),
-			wide_mul: (ElementwiseWideMul),
-		},
-	]
-);
+// Divide into 16 `u8` lanes (the 1×8b AES packing) for all three ops — no packed arithmetic
+// defined in terms of scalar arithmetic.
+pub type AesWideMul16x<T> = crate::arch::Divide<u8, T, 16>;
+pub type AesSquare16x<T> = crate::arch::Divide<u8, T, 16>;
+pub type AesInvert16x<T> = crate::arch::Divide<u8, T, 16>;

@@ -2,7 +2,7 @@
 
 use std::{iter, rc::Rc};
 
-use binius_field::{Field, field::FieldOps, util::FieldFn};
+use binius_field::{Field, field::FieldOps};
 use binius_math::{multilinear::eq::eq_ind_partial_eval_scalars, univariate::evaluate_univariate};
 use binius_spartan_frontend::constraint_system::{MulConstraint, WitnessIndex, WitnessSegment};
 
@@ -96,50 +96,4 @@ pub fn evaluate_wiring_mle_public<F: FieldOps>(
 	}
 
 	evaluate_univariate(&acc, lambda)
-}
-
-/// The public-segment contribution to the operand evaluations, as a [`FieldFn`].
-///
-/// Input layout: `[ public scalars | lambda | r_x ]`.
-/// The caller passes `r_x` directly; its eq-indicator tensor is expanded inside.
-pub struct PublicWiringEvalFn<'a> {
-	/// The MUL constraints whose public-segment wiring MLE is evaluated.
-	mul_constraints: &'a [MulConstraint<WitnessIndex>],
-	/// The number of leading input entries that are public scalars.
-	public_len: usize,
-}
-
-impl<'a> PublicWiringEvalFn<'a> {
-	/// Builds the function over the given MUL constraints and public-scalar count.
-	pub fn new(mul_constraints: &'a [MulConstraint<WitnessIndex>], public_len: usize) -> Self {
-		Self {
-			mul_constraints,
-			public_len,
-		}
-	}
-}
-
-impl<G: Field> FieldFn<G> for PublicWiringEvalFn<'_> {
-	fn n_outputs(&self) -> usize {
-		// The function produces the single public-segment evaluation.
-		1
-	}
-
-	fn call<F: FieldOps<Scalar = G> + From<G>>(&self, inputs: &[F]) -> Vec<F> {
-		// Split the flat input into its three logical parts.
-		let public = &inputs[..self.public_len];
-		let lambda = inputs[self.public_len].clone();
-		let r_x = &inputs[self.public_len + 1..];
-
-		// Expand r_x's eq-indicator tensor here.
-		// Callers pass r_x itself, not its 2^|r_x| expansion.
-		let r_x_tensor = eq_ind_partial_eval_scalars(r_x);
-
-		vec![evaluate_wiring_mle_public(
-			self.mul_constraints,
-			public,
-			lambda,
-			&r_x_tensor,
-		)]
-	}
 }

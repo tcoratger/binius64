@@ -4,7 +4,6 @@
 
 use binius_core::{
 	constraint_system::{AndConstraint, ShiftedValueIndex},
-	verify::eval_shifted_word,
 	word::Word,
 };
 use binius_utils::rayon::prelude::*;
@@ -148,13 +147,13 @@ impl BatchAndCheckWitness {
 fn eval_operand_words(words: &[Word], operand: &[ShiftedValueIndex]) -> Word {
 	operand.iter().fold(Word::ZERO, |acc, sv| {
 		let word = words[sv.value_index.0 as usize];
-		acc ^ eval_shifted_word(word, sv.shift_variant, sv.amount)
+		acc ^ sv.shift_variant.apply(word, sv.amount)
 	})
 }
 
 #[cfg(test)]
 mod tests {
-	use binius_core::{constraint_system::ValueVec, verify::eval_operand};
+	use binius_core::constraint_system::ValueVec;
 	use binius_frontend::{Circuit, CircuitBuilder, Wire};
 	use proptest::prelude::*;
 
@@ -228,9 +227,9 @@ mod tests {
 		let mut b = Vec::new();
 		let mut c = Vec::new();
 		for constraint in and_constraints {
-			a.push(eval_operand(vv, &constraint.a));
-			b.push(eval_operand(vv, &constraint.b));
-			c.push(eval_operand(vv, &constraint.c));
+			a.push(vv.eval_operand(&constraint.a));
+			b.push(vv.eval_operand(&constraint.b));
+			c.push(vv.eval_operand(&constraint.c));
 		}
 		(a, b, c)
 	}

@@ -177,7 +177,7 @@ pub struct ShiftedValueIndex {
 impl ShiftedValueIndex {
 	/// Create a value index that just uses the specified value. Equivalent to [`Self::sll`] with
 	/// amount equals 0.
-	pub fn plain(value_index: ValueIndex) -> Self {
+	pub const fn plain(value_index: ValueIndex) -> Self {
 		Self {
 			value_index,
 			shift_variant: ShiftVariant::Sll,
@@ -626,17 +626,17 @@ impl ConstraintSystem {
 	}
 
 	/// Returns the number of AND constraints in the system.
-	pub fn n_and_constraints(&self) -> usize {
+	pub const fn n_and_constraints(&self) -> usize {
 		self.and_constraints.len()
 	}
 
 	/// Returns the number of MUL  constraints in the system.
-	pub fn n_mul_constraints(&self) -> usize {
+	pub const fn n_mul_constraints(&self) -> usize {
 		self.mul_constraints.len()
 	}
 
 	/// The total length of the [`ValueVec`] expected by this constraint system.
-	pub fn value_vec_len(&self) -> usize {
+	pub const fn value_vec_len(&self) -> usize {
 		self.value_vec_layout.committed_total_len
 	}
 
@@ -724,7 +724,7 @@ impl ValueVecLayout {
 	///
 	/// - the public segment (constants and inout values) is padded to the power of two.
 	/// - the public segment is not less than the minimum size.
-	pub fn validate(&self) -> Result<(), ConstraintSystemError> {
+	pub const fn validate(&self) -> Result<(), ConstraintSystemError> {
 		if !self.offset_witness.is_power_of_two() {
 			return Err(ConstraintSystemError::PublicInputPowerOfTwo);
 		}
@@ -738,7 +738,7 @@ impl ValueVecLayout {
 	}
 
 	/// Returns true if the given index points to an area that is considered to be padding.
-	fn is_padding(&self, index: ValueIndex) -> bool {
+	const fn is_padding(&self, index: ValueIndex) -> bool {
 		let idx = index.0 as usize;
 
 		// padding 1: between constants and inout section
@@ -762,7 +762,7 @@ impl ValueVecLayout {
 	}
 
 	/// Returns true if the given index is out-of-bounds for the committed part of this layout.
-	fn is_committed_oob(&self, index: ValueIndex) -> bool {
+	const fn is_committed_oob(&self, index: ValueIndex) -> bool {
 		index.0 as usize >= self.committed_total_len
 	}
 }
@@ -929,7 +929,7 @@ impl ValueVec {
 	}
 
 	/// The total size of the committed portion of the vector (excluding scratch).
-	pub fn size(&self) -> usize {
+	pub const fn size(&self) -> usize {
 		self.layout.committed_total_len
 	}
 
@@ -1013,14 +1013,14 @@ impl<'a> ValuesData<'a> {
 	pub const SERIALIZATION_VERSION: u32 = 1;
 
 	/// Create a new ValuesData from borrowed data
-	pub fn borrowed(data: &'a [Word]) -> Self {
+	pub const fn borrowed(data: &'a [Word]) -> Self {
 		Self {
 			data: Cow::Borrowed(data),
 		}
 	}
 
 	/// Create a new ValuesData from owned data
-	pub fn owned(data: Vec<Word>) -> Self {
+	pub const fn owned(data: Vec<Word>) -> Self {
 		Self {
 			data: Cow::Owned(data),
 		}
@@ -1139,7 +1139,7 @@ impl<'a> Proof<'a> {
 	pub const SERIALIZATION_VERSION: u32 = 1;
 
 	/// Create a new Proof from borrowed transcript data
-	pub fn borrowed(data: &'a [u8], challenger_type: String) -> Self {
+	pub const fn borrowed(data: &'a [u8], challenger_type: String) -> Self {
 		Self {
 			data: Cow::Borrowed(data),
 			challenger_type,
@@ -1147,7 +1147,7 @@ impl<'a> Proof<'a> {
 	}
 
 	/// Create a new Proof from owned transcript data
-	pub fn owned(data: Vec<u8>, challenger_type: String) -> Self {
+	pub const fn owned(data: Vec<u8>, challenger_type: String) -> Self {
 		Self {
 			data: Cow::Owned(data),
 			challenger_type,
@@ -1982,12 +1982,9 @@ mod serialization_tests {
 		let non_pub2 = ValuesData::deserialize(&mut buf_non_pub.as_slice()).unwrap();
 
 		// Reconstruct ValueVec from deserialized pieces
-		let reconstructed = ValueVec::new_from_data(
-			cs2.value_vec_layout.clone(),
-			pub2.into_owned(),
-			non_pub2.into_owned(),
-		)
-		.unwrap();
+		let reconstructed =
+			ValueVec::new_from_data(cs2.value_vec_layout, pub2.into_owned(), non_pub2.into_owned())
+				.unwrap();
 
 		// Ensure committed part matches exactly
 		assert_eq!(reconstructed.combined_witness(), values.combined_witness());
@@ -2576,7 +2573,7 @@ mod serialization_tests {
 			};
 
 			// The public input must fill its whole power-of-two section, so zero-pad it.
-			let mut public_padded = public.clone();
+			let mut public_padded = public;
 			public_padded.resize(offset_witness, Word::ZERO);
 
 			let vv = ValueVec::new_from_data(layout, public_padded.clone(), private.clone()).unwrap();

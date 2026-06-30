@@ -56,15 +56,15 @@ impl Default for Config {
 }
 
 impl Config {
-	pub fn max_len_base64_jwt_header(&self) -> usize {
+	pub const fn max_len_base64_jwt_header(&self) -> usize {
 		self.max_len_json_jwt_header.div_ceil(3) * 4
 	}
 
-	pub fn max_len_base64_jwt_payload(&self) -> usize {
+	pub const fn max_len_base64_jwt_payload(&self) -> usize {
 		self.max_len_json_jwt_payload.div_ceil(3) * 4
 	}
 
-	pub fn max_len_base64_jwt_signature(&self) -> usize {
+	pub const fn max_len_base64_jwt_signature(&self) -> usize {
 		self.max_len_jwt_signature.div_ceil(3) * 4
 	}
 }
@@ -251,7 +251,7 @@ impl ZkLogin {
 		let base64_check_nonce_builder = b.subcircuit("base64_check_nonce");
 		let _base64decode_check_nonce = Base64UrlSafe::new(
 			&base64_check_nonce_builder,
-			nonce_le_for_base64.clone(),
+			nonce_le_for_base64,
 			base64_jwt_payload_nonce.to_vec(),
 			base64_check_nonce_builder.add_constant_64(32),
 		);
@@ -277,7 +277,7 @@ impl ZkLogin {
 			.collect();
 
 		let jwt_signing_payload =
-			ByteVec::new(jwt_signing_payload_sha256_message.clone(), signing_payload.len_bytes);
+			ByteVec::new(jwt_signing_payload_sha256_message, signing_payload.len_bytes);
 
 		let jwt_signature_verify =
 			Rs256Verify::new(b, jwt_signing_payload, jwt_signature.clone(), rsa_modulus);

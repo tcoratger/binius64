@@ -16,7 +16,7 @@ use crate::field_buffer::FieldSliceMut;
 /// # Returns
 ///
 /// The value with its low `bits` bits reversed
-pub fn reverse_bits(x: usize, bits: u32) -> usize {
+pub const fn reverse_bits(x: usize, bits: u32) -> usize {
 	x.reverse_bits().unbounded_shr(usize::BITS - bits)
 }
 
@@ -159,7 +159,7 @@ mod tests {
 		let data_orig = random_field_buffer::<Packed128b>(&mut rng, log_d);
 
 		let mut data_optimized = data_orig.clone();
-		let mut data_naive = data_orig.clone();
+		let mut data_naive = data_orig;
 
 		bit_reverse_packed(data_optimized.to_mut());
 		bit_reverse_packed_naive(data_naive.to_mut());

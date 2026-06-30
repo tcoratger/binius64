@@ -39,7 +39,7 @@ use binius_field::{BinaryField, Field, field::FieldOps};
 use binius_hash::binary_merkle_tree::HashSuite;
 use binius_iop::{
 	basefold,
-	basefold_compiler::BaseFoldZKVerifierCompiler,
+	basefold_compiler::BaseFoldVerifierCompiler,
 	channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec},
 	fri::{self, MinProofSizeStrategy},
 	merkle_tree::BinaryMerkleTreeScheme,
@@ -51,10 +51,7 @@ use binius_transcript::{VerifierTranscript, fiat_shamir::Challenger};
 use binius_utils::{DeserializeBytes, checked_arithmetics::checked_log_2};
 use digest::Output;
 
-use crate::{
-	constraint_system::{BlindingInfo, ConstraintSystemPadded},
-	wiring::evaluate_wiring_mle_public,
-};
+use crate::constraint_system::{BlindingInfo, ConstraintSystemPadded};
 
 pub const SECURITY_BITS: usize = 96;
 
@@ -95,16 +92,16 @@ where
 {
 	iop_verifier: IOPVerifier<F>,
 	/// BaseFold ZK compiler for creating verifier channels.
-	basefold_compiler: BaseFoldZKVerifierCompiler<F, BinaryMerkleTreeScheme<F, H>>,
+	basefold_compiler: BaseFoldVerifierCompiler<F, BinaryMerkleTreeScheme<F, H>>,
 }
 
 impl<F: Field> IOPVerifier<F> {
 	/// Constructs an IOP verifier for a constraint system.
-	pub fn new(constraint_system: ConstraintSystemPadded<F>) -> Self {
+	pub const fn new(constraint_system: ConstraintSystemPadded<F>) -> Self {
 		Self { constraint_system }
 	}
 
-	pub fn constraint_system(&self) -> &ConstraintSystemPadded<F> {
+	pub const fn constraint_system(&self) -> &ConstraintSystemPadded<F> {
 		&self.constraint_system
 	}
 
@@ -189,7 +186,6 @@ impl<F: Field> IOPVerifier<F> {
 		// field values, run the MLE evaluation in plaintext, and materialize the result as a
 		// single inout wire instead of building the entire sub-circuit.
 		let public_eval = {
-			let public_len = public.len();
 			let inputs = [
 				public.as_slice(),
 				slice::from_ref(&lambda),
@@ -197,18 +193,8 @@ impl<F: Field> IOPVerifier<F> {
 			]
 			.concat();
 
-			let mul_constraints = cs.mul_constraints();
-			channel.compute_public_value(&inputs, move |vals| {
-				let public_vals = &vals[..public_len];
-				let lambda_val = vals[public_len];
-				let r_x_tensor_vals = &vals[public_len + 1..];
-				evaluate_wiring_mle_public(
-					mul_constraints,
-					public_vals,
-					lambda_val,
-					r_x_tensor_vals,
-				)
-			})
+			let eval_fn = wiring::PublicWiringEvalFn::new(cs.mul_constraints(), public.len());
+			channel.compute_public_value(&inputs, eval_fn)
 		};
 
 		// Prover sends the precommit segment's contribution to the operand evaluations.
@@ -224,7 +210,7 @@ impl<F: Field> IOPVerifier<F> {
 			lambda.clone(),
 		);
 		let private_transparent =
-			wiring::eval_transparent(cs, WitnessSegment::Private, r_x_tensor.clone(), lambda);
+			wiring::eval_transparent(cs, WitnessSegment::Private, r_x_tensor, lambda);
 		let mask_transparent = mask_transparent(cs, &r_x);
 
 		// Verify all oracle relations
@@ -278,7 +264,7 @@ where
 		let merkle_scheme = BinaryMerkleTreeScheme::<F, H>::new();
 
 		// Create the BaseFold ZK compiler for IOP verification
-		let basefold_compiler = BaseFoldZKVerifierCompiler::new(
+		let basefold_compiler = BaseFoldVerifierCompiler::new(
 			merkle_scheme,
 			oracle_specs,
 			log_inv_rate,
@@ -293,16 +279,16 @@ where
 	}
 
 	/// Returns a reference to the IOP verifier.
-	pub fn iop_verifier(&self) -> &IOPVerifier<F> {
+	pub const fn iop_verifier(&self) -> &IOPVerifier<F> {
 		&self.iop_verifier
 	}
 
-	pub fn constraint_system(&self) -> &ConstraintSystemPadded<F> {
+	pub const fn constraint_system(&self) -> &ConstraintSystemPadded<F> {
 		self.iop_verifier.constraint_system()
 	}
 
 	/// Returns a reference to the BaseFold ZK verifier compiler.
-	pub fn iop_compiler(&self) -> &BaseFoldZKVerifierCompiler<F, BinaryMerkleTreeScheme<F, H>> {
+	pub const fn iop_compiler(&self) -> &BaseFoldVerifierCompiler<F, BinaryMerkleTreeScheme<F, H>> {
 		&self.basefold_compiler
 	}
 

@@ -6,7 +6,6 @@ use std::{fmt::Debug, mem::MaybeUninit};
 use binius_field::Field;
 use binius_utils::{
 	checked_arithmetics::log2_strict_usize,
-	mem::slice_assume_init_mut,
 	rand::par_rand,
 	rayon::{prelude::*, slice::ParallelSlice},
 };
@@ -14,7 +13,7 @@ use digest::{Digest, FixedOutputReset, Output, block_api::BlockSizeUser};
 use rand::{CryptoRng, Rng, rngs::StdRng};
 
 use super::{
-	compress::PseudoCompressionFunction, parallel_compression::ParallelPseudoCompression,
+	compress::CompressionFunction, parallel_compression::ParallelPseudoCompression,
 	parallel_digest::ParallelDigest,
 };
 
@@ -29,7 +28,7 @@ pub trait HashSuite {
 	/// Sequential hash used to compute leaf digests during verification.
 	type LeafHash: Digest + BlockSizeUser + FixedOutputReset + Send;
 	/// Sequential 2-to-1 compression used to fold inner Merkle nodes during verification.
-	type Compression: PseudoCompressionFunction<Output<Self::LeafHash>, 2> + Default;
+	type Compression: CompressionFunction<Output<Self::LeafHash>, 2> + Default;
 	/// Parallel counterpart of [`Self::LeafHash`] used during proving.
 	type ParLeafHash: ParallelDigest<Digest = Self::LeafHash> + Default;
 	/// Parallel counterpart of [`Self::Compression`] used during proving.
@@ -126,7 +125,7 @@ where
 
 	let mut prev_layer = unsafe {
 		// SAFETY: prev-layer was initialized by hash_leaves
-		slice_assume_init_mut(prev_layer)
+		prev_layer.assume_init_mut()
 	};
 	let parallel_compression = H::ParCompression::default();
 	for i in 1..(log_len + 1) {
@@ -137,7 +136,7 @@ where
 
 		prev_layer = unsafe {
 			// SAFETY: next_layer was just initialized by compress_layer
-			slice_assume_init_mut(next_layer)
+			next_layer.assume_init_mut()
 		};
 	}
 

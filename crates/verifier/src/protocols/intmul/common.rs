@@ -30,12 +30,16 @@ pub struct Phase2Output<F> {
 
 /// Output of Phase 3: batched Frobenius selector sumcheck and LO * HI product sumcheck.
 ///
-/// Contains the new evaluation point $r$, $\widetilde{b}$ evaluations, $A(r)$,
+/// Contains the new evaluation point $r$, the recombined $\widetilde{b}$ exponent claim, $A(r)$,
 /// $C_{\textsf{lo}}(r)$, and $C_{\textsf{hi}}(r)$.
 #[derive(Debug, Clone)]
 pub struct Phase3Output<F> {
 	pub eval_point: Vec<F>,
-	pub b_evals: Vec<F>,
+	/// The recombination point $r_I^b \in K^k$ sampled to collapse the $2^k$ per-bit
+	/// $\widetilde{b}$ claims into one.
+	pub r_ib: Vec<F>,
+	/// The recombined exponent claim $\widetilde{b}(r_I^b, r)$, where $r$ is `eval_point`.
+	pub b_recomb: F,
 	/// $A(r)$, where $r$ is `eval_point`.
 	pub gpow_a_eval: F,
 	/// $C_{\textsf{lo}}(r)$.
@@ -196,5 +200,58 @@ fn recover_selectors<F: FieldOps>(selecteds: Vec<F>, inv_factors: &[F]) -> Vec<F
 			// Recover s_i = (z_i - 1) * (v_i - 1)^{-1}
 			(selected - one.clone()) * inv_factor
 		})
+		.collect()
+}
+
+/// Reconstruct the "selected" leaf evaluations from the raw per-bit evaluations.
+///
+/// This is the forward direction of [`normalize_a_c_exponent_evals`]: given the raw bit
+/// evaluations $a(i, r), c_{\textsf{lo}}(i, r), c_{\textsf{hi}}(i, r)$, it returns the selected
+/// leaf values
+///
+/// * $\textsf{select}(a(i, r), g^{2^i})$,
+/// * $\textsf{select}(c_{\textsf{lo}}(i, r), g^{2^i})$,
+/// * $\textsf{select}(c_{\textsf{hi}}(i, r), g^{2^{i + k}})$,
+///
+/// for $i \in \{0, \ldots, 2^k - 1\}$, where $\textsf{select}(S, V) = S \cdot (V - 1) + 1$.
+///
+/// The verifier reconstructs these forward from the prover's raw evaluations and binds them to the
+/// GKR-verified leaf-product claims, rather than receiving them and inverting. $g$ is a constant
+/// multiplicative generator of the field $F$.
+pub fn reconstruct_selecteds<F, E>(
+	k: usize,
+	a_evals: &[E],
+	c_lo_evals: &[E],
+	c_hi_evals: &[E],
+) -> [Vec<E>; 3]
+where
+	F: Field,
+	E: FieldOps<Scalar = F> + From<F>,
+{
+	assert_eq!(a_evals.len(), 1 << k);
+	assert_eq!(c_lo_evals.len(), 1 << k);
+	assert_eq!(c_hi_evals.len(), 1 << k);
+
+	// powers[j] = g^{2^j}, for j in 0..2^{k+1}.
+	let powers: Vec<E> = iterate(F::MULTIPLICATIVE_GENERATOR, |g| g.square())
+		.take(2 << k)
+		.map(E::from)
+		.collect();
+	let (lo_powers, hi_powers) = powers.split_at(1 << k);
+
+	[
+		apply_selectors(a_evals, lo_powers),
+		apply_selectors(c_lo_evals, lo_powers),
+		apply_selectors(c_hi_evals, hi_powers),
+	]
+}
+
+/// Apply the affine selector `z * (V - 1) + 1` pointwise, given the generator powers `V_i`.
+fn apply_selectors<E: FieldOps>(raw_evals: &[E], powers: &[E]) -> Vec<E> {
+	assert_eq!(raw_evals.len(), powers.len());
+
+	let one = E::one();
+	iter::zip(raw_evals, powers)
+		.map(|(raw, power)| raw.clone() * (power.clone() - one.clone()) + one.clone())
 		.collect()
 }

@@ -2,6 +2,7 @@
 
 use std::marker::PhantomData;
 
+use binius_core::word::Word;
 use binius_field::{BinaryField, FieldOps, PackedField};
 use binius_ip_prover::{
 	channel::IPProverChannel,
@@ -10,9 +11,12 @@ use binius_ip_prover::{
 use binius_math::{
 	field_buffer::FieldBuffer,
 	inner_product::inner_product_buffers,
-	multilinear::{eq::eq_ind_partial_eval, evaluate::evaluate},
+	multilinear::{
+		eq::{eq_ind_partial_eval, eq_ind_partial_eval_scalars},
+		evaluate::evaluate,
+	},
 };
-use binius_utils::{bitwise::Bitwise, rayon::prelude::*};
+use binius_utils::rayon::prelude::*;
 use binius_verifier::protocols::{
 	intmul::common::{
 		IntMulOutput, Phase1Output, Phase2Output, Phase3Output, Phase4Output, frobenius_twist,
@@ -27,34 +31,35 @@ use super::{
 	error::Error,
 	witness::{Witness, two_valued_field_buffer},
 };
-use crate::protocols::{
-	prodcheck::ProdcheckProver,
-	sumcheck::{
-		MleToSumCheckDecorator,
-		batch::{BatchSumcheckOutput, batch_prove_and_write_evals},
-		bivariate_product_mle,
-		bivariate_product_multi_mle::BivariateProductMultiMlecheckProver,
-		rerand_mle::RerandMlecheckProver,
-		selector_mle::{Claim, SelectorMlecheckProver},
+use crate::{
+	fold_word::{fold_across_words, fold_words},
+	protocols::{
+		prodcheck::ProdcheckProver,
+		sumcheck::{
+			MleToSumCheckDecorator,
+			batch::{BatchSumcheckOutput, batch_prove_and_write_evals},
+			bivariate_product_mle,
+			bivariate_product_multi_mle::BivariateProductMultiMlecheckProver,
+			multilinear_eval::MultilinearEvalProver,
+			selector_mle::{Claim, SelectorMlecheckProver},
+		},
 	},
 };
 
 /// A helper structure that encapsulates switchover settings and the prover channel for
 /// the integer multiplication protocol.
-pub struct IntMulProver<'a, P, B, S, Channel> {
+pub struct IntMulProver<'a, P, S, Channel> {
 	_p_marker: PhantomData<P>,
-	_b_marker: PhantomData<B>,
 	_s_marker: PhantomData<S>,
 
 	switchover: usize,
 	channel: &'a mut Channel,
 }
 
-impl<'a, P, B, S, Channel> IntMulProver<'a, P, B, S, Channel> {
-	pub fn new(switchover: usize, channel: &'a mut Channel) -> Self {
+impl<'a, P, S, Channel> IntMulProver<'a, P, S, Channel> {
+	pub const fn new(switchover: usize, channel: &'a mut Channel) -> Self {
 		Self {
 			_p_marker: PhantomData,
-			_b_marker: PhantomData,
 			_s_marker: PhantomData,
 			switchover,
 			channel,
@@ -62,12 +67,11 @@ impl<'a, P, B, S, Channel> IntMulProver<'a, P, B, S, Channel> {
 	}
 }
 
-impl<'a, F, P, B, S, Channel> IntMulProver<'a, P, B, S, Channel>
+impl<'a, F, P, S, Channel> IntMulProver<'a, P, S, Channel>
 where
 	F: BinaryField,
 	P: PackedField<Scalar = F>,
-	B: Bitwise,
-	S: AsRef<[B]> + Sync,
+	S: AsRef<[u64]> + Sync,
 	Channel: IPProverChannel<F>,
 {
 	/// Prove an integer multiplication statement.
@@ -83,16 +87,17 @@ where
 	///    - Phase 2: Frobenius twist is applied to obtain claims on $b * (G^{a_i} - 1) + 1$
 	///    - Phase 3: Two batched sumchecks:
 	///      - Selector mlecheck to reduce claims on $b * (G^{a_i} - 1) + 1$ to claims on $G^{a_i}$
-	///        and $b$
+	///        and $b$, then recombine the $2^k$ per-bit `b` claims into one via a sampled $r_I^b$
 	///      - First layer of GPA reduction for the `c_lo || c_hi` combined `c` tree
 	///    - Phase 4: Batching all but last layers and `a`, `c_lo` and `c_hi`
-	///    - Phase 5: Proving the last (widest) layers of `a`, `c_lo` and `c_hi` batched with
-	///      rerandomization degree-1 mlecheck on `b` evaluations from phase 3
+	///    - Phase 5: Proving the last (widest) layers of `a`, `c_lo` and `c_hi` batched with a
+	///      single-claim rerandomization (MLE-eval) of the recombined `b` exponent claim from phase
+	///      3
 	///
 	/// The output of this protocol is a set of evaluation claims on the `b` selectors representing
 	/// all of `a`, `b`, `c_lo` and `c_hi` as column-major bit matrices, at a common evaluation
 	/// point.
-	pub fn prove(&mut self, witness: Witness<P, B, S>) -> Result<IntMulOutput<F>, Error> {
+	pub fn prove(&mut self, witness: Witness<P, u64, S>) -> Result<IntMulOutput<F>, Error> {
 		let Witness {
 			a,
 			b_exponents,
@@ -137,7 +142,8 @@ where
 		// Phase 3
 		let Phase3Output {
 			eval_point: phase3_eval_point,
-			b_evals,
+			r_ib,
+			b_recomb,
 			gpow_a_eval,
 			gpow_c_lo_eval,
 			gpow_c_hi_eval,
@@ -175,7 +181,8 @@ where
 			(&c_hi_evals, c_hi_last_layer),
 			b_exponents.as_ref(),
 			&phase3_eval_point,
-			&b_evals,
+			&r_ib,
+			b_recomb,
 			a_exponents.as_ref(),
 			c_lo_exponents.as_ref(),
 		)
@@ -225,7 +232,7 @@ where
 		twisted_eval_points: &[Vec<F>],
 		twisted_evals: &[F],
 		selector: FieldBuffer<P>,
-		b_exponents: &[B],
+		b_exponents: &[u64],
 		c_lo_hi_roots: [FieldBuffer<P>; 2],
 		c_eval_point: &[F],
 		c_root_eval: F,
@@ -245,8 +252,21 @@ where
 			})
 			.collect();
 
-		let selector_prover =
-			SelectorMlecheckProver::new(selector, selector_claims, b_exponents, self.switchover)?;
+		// Batch the 2^k Frobenius-twisted leaf claims with eq_k(γ, i): sample γ in K^k and pass the
+		// eq_k(γ, ·) weights to the selector prover, which combines its 2^k per-claim round
+		// polynomials into a single weighted one. This replaces a univariate-power batch over the
+		// 2^k claims with a multilinear one; the verifier mirrors it by weighting the corresponding
+		// terms by eq_k(γ, ·). γ is sampled before the batched sumcheck so the round polynomials
+		// are fixed against it.
+		let gamma = self.channel.sample_many(log_bits);
+		let eq_weights = eq_ind_partial_eval_scalars::<F>(&gamma);
+		let selector_prover = SelectorMlecheckProver::new(
+			selector,
+			selector_claims,
+			b_exponents,
+			eq_weights,
+			self.switchover,
+		)?;
 
 		let c_root_sumcheck_prover =
 			bivariate_product_mle::new(c_lo_hi_roots, c_eval_point.to_vec(), c_root_eval)?;
@@ -273,9 +293,16 @@ where
 			.try_into()
 			.expect("c_root_prover with two multilinears returns two evals");
 
+		// Recombine the 2^k per-bit b(i, r) claims into a single claim b(r_I^b, r) by sampling a
+		// recombination point r_I^b in K^k, matching the verifier. This carries one exponent claim
+		// (rather than 2^k) into Phases 4 and 5.
+		let r_ib = self.channel.sample_many(log_bits);
+		let b_recomb = evaluate(&FieldBuffer::<P>::from_values(&b_evals), &r_ib);
+
 		Ok(Phase3Output {
 			eval_point: challenges,
-			b_evals,
+			r_ib,
+			b_recomb,
 			gpow_a_eval,
 			gpow_c_lo_eval,
 			gpow_c_hi_eval,
@@ -346,12 +373,13 @@ where
 		(a_evals, a_layer): (&[F], Vec<FieldBuffer<P>>),
 		(c_lo_evals, c_lo_layer): (&[F], Vec<FieldBuffer<P>>),
 		(c_hi_evals, c_hi_layer): (&[F], Vec<FieldBuffer<P>>),
-		b_exponents: &[B],
+		b_exponents: &[u64],
 		b_eval_point: &[F],
-		b_evals_pre: &[F],
+		r_ib: &[F],
+		b_recomb: F,
 		// Needed for the zerocheck on `a_0 * b_0 = c_lo_0`.
-		a_exponents: &[B],
-		c_lo_exponents: &[B],
+		a_exponents: &[u64],
+		c_lo_exponents: &[u64],
 	) -> Result<IntMulOutput<F>, Error> {
 		assert!(log_bits >= 1);
 		assert_eq!(1 << log_bits, a_layer.len());
@@ -382,27 +410,34 @@ where
 		let b_0: FieldBuffer<P> = two_valued_field_buffer(0, &b_exponents, binary_elements);
 		let c_lo_0: FieldBuffer<P> = two_valued_field_buffer(0, &c_lo_exponents, binary_elements);
 
-		// Make the sumcheck prover for the overflow parity check.
+		// Make the sumcheck prover for the overflow parity check, binding it at the Phase-2
+		// constraint point `b_eval_point` (r_2) per the spec (reused for free from the `b`
+		// re-randomization) rather than the Phase-4 point.
 		let overflow_prover =
 			MleToSumCheckDecorator::new(QuadraticMleCheckProver::<P, _, _, 3>::new(
 				[a_0, b_0, c_lo_0],
 				|[a, b, c]| a * b - c,
 				|[a, b, _c]| a * b,
-				a_c_eval_point.to_vec(),
+				b_eval_point.to_vec(),
 				F::ZERO,
 			)?);
 
-		// Make the `RerandMlecheckProver` for `b_exponents`.
+		// Fold the 2^k b bit-columns by the recombination tensor into a single field multilinear
+		// B(x) = sum_i eq(r_I^b, i) * b(i, x), then re-randomize its claim B(r_2) = b_recomb from
+		// `b_eval_point` (r_2) to the shared point via a single-claim MLE-eval check. This
+		// replaces the 2^k separate b rerandomizations with the spec's single recombined claim.
 		assert_eq!(b_exponents.len(), 1 << b_eval_point.len());
-		assert_eq!(b_evals_pre.len(), 1 << log_bits);
 
-		let b_rerand_prover = RerandMlecheckProver::<P, _>::new(
-			b_eval_point,
-			b_evals_pre,
-			b_exponents,
-			self.switchover,
-		)?;
-		let b_sumcheck_prover = MleToSumCheckDecorator::new(b_rerand_prover);
+		let b_words = b_exponents
+			.iter()
+			.map(|&word| Word::from_u64(word))
+			.collect::<Vec<_>>();
+
+		let b_tensor = eq_ind_partial_eval_scalars::<F>(r_ib);
+		let b_folded = fold_words::<_, P>(&b_words, &b_tensor);
+
+		let b_eval_prover = MultilinearEvalProver::new(b_folded, b_eval_point, b_recomb)?;
+		let b_sumcheck_prover = MleToSumCheckDecorator::new(b_eval_prover);
 
 		// Batch prove all three provers.
 		let BatchSumcheckOutput {
@@ -417,30 +452,45 @@ where
 			self.channel,
 		)?;
 
-		// Pull out the evals of all three provers.
-		let [mut bivariate_evals, lsb_evals, b_evals] = multilinear_evals
+		// Pull out the evals of all three provers. The b prover is now a single-claim MLE-eval
+		// check, so it yields one recombined eval B(r_x) rather than 2^k per-bit evals.
+		let [mut bivariate_evals, lsb_evals, b_recomb_evals] = multilinear_evals
 			.try_into()
 			.expect("batch_prove with 3 provers returns 3 multilinear_evals vecs");
 
 		assert_eq!(bivariate_evals.len(), 3 << log_bits);
 		assert_eq!(lsb_evals.len(), 3);
-		assert_eq!(b_evals.len(), 1 << log_bits);
+		assert_eq!(b_recomb_evals.len(), 1);
+
+		// The prover still sends the 2^k raw per-bit evals b(i, r_x) for Phase-5 leaf
+		// reconstruction; the verifier binds them via sum_i eq(r_I^b, i) * b(i, r_x) = B(r_x).
+		let b_evals = fold_across_words::<_, P>(&b_words, &challenges).to_vec();
+
+		// Sanity: the single recombined rerandomization eval B(r_x) equals the recombination of
+		// the raw per-bit evals.
+		debug_assert_eq!(
+			b_recomb_evals[0],
+			evaluate(&FieldBuffer::<P>::from_values(&b_evals), r_ib)
+		);
 
 		let selected_c_hi_evals = bivariate_evals.split_off(2 << log_bits);
 		let selected_c_lo_evals = bivariate_evals.split_off(1 << log_bits);
 		let selected_a_evals = bivariate_evals;
 
-		self.channel.send_many(&selected_a_evals);
-		self.channel.send_many(&selected_c_lo_evals);
-		self.channel.send_many(&selected_c_hi_evals);
-		self.channel.send_many(&b_evals);
-
+		// Recover the raw per-bit evaluations from the leaf selectors and send those (spec Phase
+		// 5). The verifier reconstructs the selectors forward rather than receiving them and
+		// inverting.
 		let [a_evals, c_lo_evals, c_hi_evals] = normalize_a_c_exponent_evals(
 			log_bits,
 			selected_a_evals,
 			selected_c_lo_evals,
 			selected_c_hi_evals,
 		);
+
+		self.channel.send_many(&a_evals);
+		self.channel.send_many(&c_lo_evals);
+		self.channel.send_many(&c_hi_evals);
+		self.channel.send_many(&b_evals);
 
 		let [a_0_eval, b_0_eval, c_lo_0_eval] =
 			lsb_evals.try_into().expect("c_lo_prover_evals.len() == 3");

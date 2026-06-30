@@ -8,13 +8,14 @@
 //! such as standard hash functions (SHA-256).
 
 pub mod binary_merkle_tree;
+pub mod blake3;
 pub mod compress;
 pub mod parallel_compression;
 pub mod parallel_digest;
 mod serialization;
 pub mod sha256;
 
-pub use compress::{CompressionFunction, PseudoCompressionFunction};
+pub use compress::CompressionFunction;
 pub use parallel_compression::{ParallelCompressionAdaptor, ParallelPseudoCompression};
 pub use parallel_digest::{
 	MultiDigest, ParallelDigest, ParallelDigestAdapter, ParallelMultidigestImpl,

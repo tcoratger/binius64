@@ -15,7 +15,7 @@ use crate::util::num_biguint_from_u64_limbs;
 pub struct ModDivideHint;
 
 impl ModDivideHint {
-	pub fn new() -> Self {
+	pub const fn new() -> Self {
 		Self
 	}
 }
@@ -61,7 +61,7 @@ impl Hint for ModDivideHint {
 			let quotient = if numerator >= dividend {
 				(numerator - &dividend) / &modulus
 			} else {
-				zero.clone()
+				zero
 			};
 			(quotient, slope)
 		} else {

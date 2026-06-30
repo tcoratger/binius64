@@ -161,11 +161,11 @@ impl<F: Field> EvaluationDomain<F> {
 		Self { points, weights }
 	}
 
-	pub fn size(&self) -> usize {
+	pub const fn size(&self) -> usize {
 		self.points.len()
 	}
 
-	pub fn points(&self) -> &[F] {
+	pub const fn points(&self) -> &[F] {
 		self.points.as_slice()
 	}
 
@@ -416,7 +416,7 @@ mod tests {
 
 		// Create a small domain
 		let domain_points: Vec<B128> = (0..10).map(|_| B128::random(&mut rng)).collect();
-		let evaluation_domain = EvaluationDomain::from_points(domain_points.clone());
+		let evaluation_domain = EvaluationDomain::from_points(domain_points);
 
 		// Create random values for interpolation
 		let values: Vec<B128> = (0..10).map(|_| B128::random(&mut rng)).collect();

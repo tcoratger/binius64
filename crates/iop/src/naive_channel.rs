@@ -6,7 +6,7 @@
 //! that reads full polynomial data from the transcript instead of verifying FRI commitments.
 //! This is intended for unit testing of protocols without the overhead of BaseFold/FRI.
 
-use binius_field::Field;
+use binius_field::{Field, util::FieldFn};
 use binius_ip::channel::IPVerifierChannel;
 use binius_math::{FieldBuffer, inner_product::inner_product_buffers};
 use binius_transcript::{
@@ -60,7 +60,7 @@ where
 	///
 	/// * `transcript` - The verifier transcript for Fiat-Shamir (borrowed mutably)
 	/// * `oracle_specs` - Specifications for each oracle to be received (borrowed)
-	pub fn new(
+	pub const fn new(
 		transcript: &'a mut VerifierTranscript<Challenger_>,
 		oracle_specs: &'a [OracleSpec],
 	) -> Self {
@@ -73,7 +73,7 @@ where
 	}
 
 	/// Returns a reference to the underlying transcript.
-	pub fn transcript(&self) -> &VerifierTranscript<Challenger_> {
+	pub const fn transcript(&self) -> &VerifierTranscript<Challenger_> {
 		self.transcript
 	}
 
@@ -134,8 +134,8 @@ where
 		}
 	}
 
-	fn compute_public_value(&mut self, inputs: &[F], f: impl FnOnce(&[F]) -> F) -> F {
-		f(inputs)
+	fn compute_public_value(&mut self, inputs: &[F], f: impl FieldFn<F>) -> F {
+		f.call::<F>(inputs)
 	}
 }
 

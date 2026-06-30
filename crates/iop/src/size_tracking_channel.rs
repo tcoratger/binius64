@@ -5,7 +5,7 @@
 //!
 //! This is useful for estimating proof sizes without running the full protocol.
 
-use binius_field::BinaryField;
+use binius_field::{BinaryField, util::FieldFn};
 use binius_ip::channel::IPVerifierChannel;
 
 use crate::{
@@ -41,7 +41,7 @@ impl<'a, F: BinaryField, MerkleScheme_: MerkleTreeScheme<F>>
 	SizeTrackingChannel<'a, F, MerkleScheme_>
 {
 	/// Creates a new size-tracking channel with default element (16) and oracle (32) sizes.
-	pub fn new(
+	pub const fn new(
 		oracle_specs: Vec<OracleSpec>,
 		fri_params: &'a [FRIParams<F>],
 		merkle_scheme: &'a MerkleScheme_,
@@ -56,7 +56,7 @@ impl<'a, F: BinaryField, MerkleScheme_: MerkleTreeScheme<F>>
 	}
 
 	/// Creates a new size-tracking channel with custom element and oracle sizes.
-	pub fn with_sizes(
+	pub const fn with_sizes(
 		oracle_specs: Vec<OracleSpec>,
 		fri_params: &'a [FRIParams<F>],
 		merkle_scheme: &'a MerkleScheme_,
@@ -75,7 +75,7 @@ impl<'a, F: BinaryField, MerkleScheme_: MerkleTreeScheme<F>>
 	}
 
 	/// Returns the accumulated proof size in bytes.
-	pub fn proof_size(&self) -> usize {
+	pub const fn proof_size(&self) -> usize {
 		self.proof_size
 	}
 }
@@ -116,8 +116,8 @@ impl<F: BinaryField, MerkleScheme_: MerkleTreeScheme<F>> IPVerifierChannel<F>
 		Ok(())
 	}
 
-	fn compute_public_value(&mut self, inputs: &[F], f: impl FnOnce(&[F]) -> F) -> F {
-		f(inputs)
+	fn compute_public_value(&mut self, inputs: &[F], f: impl FieldFn<F>) -> F {
+		f.call::<F>(inputs)
 	}
 }
 

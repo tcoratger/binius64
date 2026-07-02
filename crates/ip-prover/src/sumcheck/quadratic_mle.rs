@@ -6,7 +6,10 @@ use binius_ip::sumcheck::RoundCoeffs;
 use binius_math::{AsSlicesMut, FieldSliceMut, multilinear::fold::fold_highest_var_inplace};
 use binius_utils::rayon::prelude::*;
 
-use super::{common::SumcheckProver, error::Error, gruen32::Gruen32, round_evals::WideRoundEvals2};
+use super::{
+	common::SumcheckProver, error::Error, gruen32::Gruen32, round_evals::WideRoundEvals2,
+	round_state::RoundState,
+};
 use crate::sumcheck::common::MleCheckProver;
 
 /// MLE-check prover for polynomials defined as quadratic compositions of N multilinear polynomials.
@@ -23,7 +26,7 @@ pub struct QuadraticMleCheckProver<P: PackedField, Composition, InfinityComposit
 	multilinears: Box<dyn AsSlicesMut<P, N> + Send>,
 	composition: Composition,
 	infinity_composition: InfinityComposition,
-	last_coeffs_or_eval: RoundCoeffsOrEval<P::Scalar>,
+	last_coeffs_or_eval: RoundState<RoundCoeffs<P::Scalar>, P::Scalar>,
 	gruen32: Gruen32<P>,
 }
 
@@ -84,7 +87,7 @@ where
 			}
 		}
 
-		let last_coeffs_or_eval = RoundCoeffsOrEval::Eval(eval_claim);
+		let last_coeffs_or_eval = RoundState::Claim(eval_claim);
 		let gruen32 = Gruen32::new(&eval_point);
 
 		Ok(Self {
@@ -125,8 +128,8 @@ where
 
 	fn round_claim(&self) -> Vec<F> {
 		let claim = match &self.last_coeffs_or_eval {
-			RoundCoeffsOrEval::Eval(eval) => *eval,
-			RoundCoeffsOrEval::Coeffs(coeffs) => {
+			RoundState::Claim(eval) => *eval,
+			RoundState::Coeffs(coeffs) => {
 				coeffs.lerp_over_endpoints(self.gruen32.next_coordinate())
 			}
 		};
@@ -134,10 +137,7 @@ where
 	}
 
 	fn execute(&mut self) -> Result<Vec<RoundCoeffs<F>>, Error> {
-		let last_eval = match &self.last_coeffs_or_eval {
-			RoundCoeffsOrEval::Eval(eval) => *eval,
-			RoundCoeffsOrEval::Coeffs(_) => return Err(Error::ExpectedFold),
-		};
+		let last_eval = *self.last_coeffs_or_eval.claim()?;
 
 		let n_vars_remaining = self.gruen32.n_vars_remaining();
 		assert!(n_vars_remaining > 0);
@@ -194,14 +194,12 @@ where
 		let alpha = self.gruen32.next_coordinate();
 		let round_coeffs = round_evals.interpolate_eq(last_eval, alpha);
 
-		self.last_coeffs_or_eval = RoundCoeffsOrEval::Coeffs(round_coeffs.clone());
+		self.last_coeffs_or_eval = RoundState::Coeffs(round_coeffs.clone());
 		Ok(vec![round_coeffs])
 	}
 
 	fn fold(&mut self, challenge: F) -> Result<(), Error> {
-		let RoundCoeffsOrEval::Coeffs(coeffs) = &self.last_coeffs_or_eval else {
-			return Err(Error::ExpectedExecute);
-		};
+		let coeffs = self.last_coeffs_or_eval.coeffs()?;
 
 		assert!(
 			self.n_vars() > 0,
@@ -218,18 +216,13 @@ where
 		}
 
 		self.gruen32.fold(challenge);
-		self.last_coeffs_or_eval = RoundCoeffsOrEval::Eval(eval);
+		self.last_coeffs_or_eval = RoundState::Claim(eval);
 		Ok(())
 	}
 
 	fn finish(mut self) -> Result<Vec<F>, Error> {
 		if self.n_vars() > 0 {
-			let error = match self.last_coeffs_or_eval {
-				RoundCoeffsOrEval::Coeffs(_) => Error::ExpectedFold,
-				RoundCoeffsOrEval::Eval(_) => Error::ExpectedExecute,
-			};
-
-			return Err(error);
+			return Err(self.last_coeffs_or_eval.unfinished_err());
 		}
 
 		let multilinear_evals = self
@@ -253,12 +246,6 @@ where
 	fn eval_point(&self) -> &[F] {
 		&self.gruen32.eval_point()[..self.n_vars()]
 	}
-}
-
-#[derive(Debug, Clone)]
-enum RoundCoeffsOrEval<F: Field> {
-	Coeffs(RoundCoeffs<F>),
-	Eval(F),
 }
 
 #[cfg(test)]

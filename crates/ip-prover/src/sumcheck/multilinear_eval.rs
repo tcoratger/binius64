@@ -11,6 +11,7 @@ use super::{
 	error::Error,
 	gruen32::Gruen32,
 	round_evals::RoundEvals1,
+	round_state::RoundState,
 };
 
 /// An [`MleCheckProver`] for the multilinear extension evaluation of a single multilinear
@@ -31,7 +32,7 @@ use super::{
 pub struct MultilinearEvalProver<P: PackedField> {
 	witness: FieldBuffer<P>,
 	gruen32: Gruen32<P>,
-	last_coeffs_or_sum: RoundCoeffsOrSum<P::Scalar>,
+	last_coeffs_or_sum: RoundState<RoundCoeffs<P::Scalar>, P::Scalar>,
 }
 
 impl<F: Field, P: PackedField<Scalar = F>> MultilinearEvalProver<P> {
@@ -48,7 +49,7 @@ impl<F: Field, P: PackedField<Scalar = F>> MultilinearEvalProver<P> {
 		Ok(Self {
 			witness,
 			gruen32: Gruen32::new(eval_point),
-			last_coeffs_or_sum: RoundCoeffsOrSum::Sum(eval_claim),
+			last_coeffs_or_sum: RoundState::Claim(eval_claim),
 		})
 	}
 }
@@ -64,8 +65,8 @@ impl<F: Field, P: PackedField<Scalar = F>> SumcheckProver<F> for MultilinearEval
 
 	fn round_claim(&self) -> Vec<F> {
 		let claim = match &self.last_coeffs_or_sum {
-			RoundCoeffsOrSum::Sum(sum) => *sum,
-			RoundCoeffsOrSum::Coeffs(coeffs) => {
+			RoundState::Claim(sum) => *sum,
+			RoundState::Coeffs(coeffs) => {
 				coeffs.lerp_over_endpoints(self.gruen32.next_coordinate())
 			}
 		};
@@ -73,10 +74,7 @@ impl<F: Field, P: PackedField<Scalar = F>> SumcheckProver<F> for MultilinearEval
 	}
 
 	fn execute(&mut self) -> Result<Vec<RoundCoeffs<F>>, Error> {
-		let RoundCoeffsOrSum::Sum(sum) = &self.last_coeffs_or_sum else {
-			return Err(Error::ExpectedFold);
-		};
-		let sum = *sum;
+		let sum = *self.last_coeffs_or_sum.claim()?;
 
 		let n_vars_remaining = self.n_vars();
 		assert!(n_vars_remaining > 0);
@@ -102,14 +100,12 @@ impl<F: Field, P: PackedField<Scalar = F>> SumcheckProver<F> for MultilinearEval
 			.sum_scalars(n_vars_remaining)
 			.interpolate_eq(sum, alpha);
 
-		self.last_coeffs_or_sum = RoundCoeffsOrSum::Coeffs(round_coeffs.clone());
+		self.last_coeffs_or_sum = RoundState::Coeffs(round_coeffs.clone());
 		Ok(vec![round_coeffs])
 	}
 
 	fn fold(&mut self, challenge: F) -> Result<(), Error> {
-		let RoundCoeffsOrSum::Coeffs(coeffs) = &self.last_coeffs_or_sum else {
-			return Err(Error::ExpectedExecute);
-		};
+		let coeffs = self.last_coeffs_or_sum.coeffs()?;
 
 		assert!(self.n_vars() > 0);
 
@@ -118,17 +114,13 @@ impl<F: Field, P: PackedField<Scalar = F>> SumcheckProver<F> for MultilinearEval
 		fold_highest_var_inplace(&mut self.witness, challenge);
 		self.gruen32.fold(challenge);
 
-		self.last_coeffs_or_sum = RoundCoeffsOrSum::Sum(sum);
+		self.last_coeffs_or_sum = RoundState::Claim(sum);
 		Ok(())
 	}
 
 	fn finish(self) -> Result<Vec<F>, Error> {
 		if self.n_vars() > 0 {
-			let error = match self.last_coeffs_or_sum {
-				RoundCoeffsOrSum::Coeffs(_) => Error::ExpectedFold,
-				RoundCoeffsOrSum::Sum(_) => Error::ExpectedExecute,
-			};
-			return Err(error);
+			return Err(self.last_coeffs_or_sum.unfinished_err());
 		}
 
 		debug_assert_eq!(self.witness.log_len(), 0);
@@ -140,12 +132,6 @@ impl<F: Field, P: PackedField<Scalar = F>> MleCheckProver<F> for MultilinearEval
 	fn eval_point(&self) -> &[F] {
 		self.gruen32.eval_point()
 	}
-}
-
-#[derive(Debug, Clone)]
-enum RoundCoeffsOrSum<F: Field> {
-	Coeffs(RoundCoeffs<F>),
-	Sum(F),
 }
 
 #[cfg(test)]

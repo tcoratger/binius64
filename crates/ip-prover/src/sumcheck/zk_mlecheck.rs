@@ -19,6 +19,7 @@ use binius_math::{
 use super::{
 	Error,
 	common::{MleCheckProver, SumcheckProver},
+	round_state::RoundState,
 };
 use crate::channel::IPProverChannel;
 
@@ -207,13 +208,7 @@ pub struct MleCheckMaskProver<F: Field, P: PackedField<Scalar = F>, Data: Deref<
 	/// Precomputed (1-z_j)*g_j(0) + z_j*g_j(1) for each variable
 	suffix_sums: Vec<F>,
 	/// State: either last round coefficients (after execute) or current claim (after fold)
-	last_coeffs_or_claim: RoundCoeffsOrClaim<F>,
-}
-
-#[derive(Debug, Clone)]
-enum RoundCoeffsOrClaim<F: Field> {
-	Coeffs(RoundCoeffs<F>),
-	Claim(F),
+	last_coeffs_or_claim: RoundState<RoundCoeffs<F>, F>,
 }
 
 impl<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>>
@@ -251,7 +246,7 @@ impl<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>>
 			n_vars_remaining: n_vars,
 			prefix_sum: F::ZERO,
 			suffix_sums,
-			last_coeffs_or_claim: RoundCoeffsOrClaim::Claim(eval_claim),
+			last_coeffs_or_claim: RoundState::Claim(eval_claim),
 		}
 	}
 
@@ -275,8 +270,8 @@ impl<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>> SumcheckPr
 
 	fn round_claim(&self) -> Vec<F> {
 		let claim = match &self.last_coeffs_or_claim {
-			RoundCoeffsOrClaim::Claim(claim) => *claim,
-			RoundCoeffsOrClaim::Coeffs(coeffs) => {
+			RoundState::Claim(claim) => *claim,
+			RoundState::Coeffs(coeffs) => {
 				let alpha = self.eval_point[self.n_vars_remaining - 1];
 				coeffs.lerp_over_endpoints(alpha)
 			}
@@ -285,9 +280,7 @@ impl<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>> SumcheckPr
 	}
 
 	fn execute(&mut self) -> Result<Vec<RoundCoeffs<F>>, Error> {
-		let RoundCoeffsOrClaim::Claim(_claim) = &self.last_coeffs_or_claim else {
-			return Err(Error::ExpectedFold);
-		};
+		self.last_coeffs_or_claim.claim()?;
 
 		if self.n_vars_remaining == 0 {
 			return Err(Error::ExpectedFinish);
@@ -314,14 +307,12 @@ impl<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>> SumcheckPr
 		}
 
 		let round_coeffs = RoundCoeffs(round_coeffs_vec);
-		self.last_coeffs_or_claim = RoundCoeffsOrClaim::Coeffs(round_coeffs.clone());
+		self.last_coeffs_or_claim = RoundState::Coeffs(round_coeffs.clone());
 		Ok(vec![round_coeffs])
 	}
 
 	fn fold(&mut self, challenge: F) -> Result<(), Error> {
-		let RoundCoeffsOrClaim::Coeffs(coeffs) = &self.last_coeffs_or_claim else {
-			return Err(Error::ExpectedExecute);
-		};
+		let coeffs = self.last_coeffs_or_claim.coeffs()?;
 
 		// Evaluate round polynomial at challenge to get new claim
 		let new_claim = coeffs.evaluate(challenge);
@@ -332,17 +323,14 @@ impl<F: Field, P: PackedField<Scalar = F>, Data: Deref<Target = [P]>> SumcheckPr
 		self.prefix_sum += self.mask.evaluate_univariate(var_idx, challenge);
 
 		self.n_vars_remaining -= 1;
-		self.last_coeffs_or_claim = RoundCoeffsOrClaim::Claim(new_claim);
+		self.last_coeffs_or_claim = RoundState::Claim(new_claim);
 
 		Ok(())
 	}
 
 	fn finish(self) -> Result<Vec<F>, Error> {
 		if self.n_vars_remaining > 0 {
-			return match self.last_coeffs_or_claim {
-				RoundCoeffsOrClaim::Coeffs(_) => Err(Error::ExpectedFold),
-				RoundCoeffsOrClaim::Claim(_) => Err(Error::ExpectedExecute),
-			};
+			return Err(self.last_coeffs_or_claim.unfinished_err());
 		}
 
 		// Final evaluation of g at the challenge point is prefix_sum

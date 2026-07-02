@@ -15,7 +15,7 @@
 //! - SVE2 on capable ARM64 -> width-agnostic vectors.
 //!
 //! Output is bit-identical to `blake3::hash`, pinned to the reference in tests.
-//! Scope: a single chunk of whole 64-byte blocks (`M <= 1024`), like the SIMD leaf digest.
+//! Scope: any message up to one 1024-byte chunk, including sub-block and partial-block leaves.
 
 use std::{array, mem::MaybeUninit};
 
@@ -101,6 +101,24 @@ fn permute<const N: usize>(m: &mut [[u32; N]; 16]) {
 	*m = permuted;
 }
 
+/// Loads one 64-byte block per lane into 16 little-endian message words.
+#[inline(always)]
+fn load_block_words<const N: usize>(block: &[[u8; BLOCK_LEN]; N]) -> [[u32; N]; 16] {
+	let mut m = [[0u32; N]; 16];
+	for lane in 0..N {
+		for (w, slot) in m.iter_mut().enumerate() {
+			let off = w * 4;
+			slot[lane] = u32::from_le_bytes([
+				block[lane][off],
+				block[lane][off + 1],
+				block[lane][off + 2],
+				block[lane][off + 3],
+			]);
+		}
+	}
+	m
+}
+
 /// Compresses one 64-byte block across all `N` lanes, updating the chaining value in place.
 ///
 /// The counter, block length, and flags are shared by every lane, so they broadcast.
@@ -154,112 +172,89 @@ fn compress_block<const N: usize>(
 	}
 }
 
-/// Hashes `N` single-chunk messages of `M` bytes each, writing one 32-byte digest per lane.
-///
-/// `M` is a positive multiple of the 64-byte block, no larger than one 1024-byte chunk.
-/// Every lane is its own chunk at counter 0.
-///
-/// The first block flags `CHUNK_START`.
-/// The last block flags `CHUNK_END | ROOT`, so its chaining value is the lane's root digest.
-fn hash_many_portable<const M: usize, const N: usize>(
-	inputs: &[&[u8; M]; N],
-	out: &mut [MaybeUninit<Output<blake3::Hasher>>; N],
-) {
-	// `M` is a whole number of blocks by construction.
-	let n_blocks = M / BLOCK_LEN;
-	// Every lane's chaining value starts at the IV.
-	let mut cv: [[u32; N]; 8] = array::from_fn(|w| [IV[w]; N]);
-
-	for block_idx in 0..n_blocks {
-		// Load this block of every lane into 16 little-endian words.
-		let base = block_idx * BLOCK_LEN;
-		let mut m = [[0u32; N]; 16];
-		for lane in 0..N {
-			for (w, slot) in m.iter_mut().enumerate() {
-				let off = base + w * 4;
-				slot[lane] = u32::from_le_bytes([
-					inputs[lane][off],
-					inputs[lane][off + 1],
-					inputs[lane][off + 2],
-					inputs[lane][off + 3],
-				]);
-			}
-		}
-
-		// The single chunk is the tree root, so its last block carries CHUNK_END | ROOT.
-		let mut flags = 0;
-		if block_idx == 0 {
-			flags |= CHUNK_START;
-		}
-		if block_idx == n_blocks - 1 {
-			flags |= CHUNK_END | ROOT;
-		}
-		compress_block(&mut cv, &m, 0, BLOCK_LEN as u32, flags);
-	}
-
-	// Serialize each lane's eight-word chaining value into its 32-byte digest.
-	for lane in 0..N {
-		let mut digest = [0u8; OUT_LEN];
-		for (w, chunk) in digest.chunks_exact_mut(4).enumerate() {
-			chunk.copy_from_slice(&cv[w][lane].to_le_bytes());
-		}
-		out[lane].write(digest.into());
-	}
+/// Broadcasts the eight IV words across `N` lanes to seed a fresh chaining value.
+#[inline(always)]
+fn broadcast_iv<const N: usize>() -> [[u32; N]; 8] {
+	array::from_fn(|w| [IV[w]; N])
 }
 
-/// Maps a runtime block count in `1..=16` to a portable batch of compile-time leaf length.
-macro_rules! dispatch_portable_blocks {
-	($n_blocks:expr, $lanes:ident, $source:expr, $out:expr) => {{
-		macro_rules! arm {
-			($len:literal) => {
-				ParallelMultidigestImpl::<PortableBlake3MultiDigest<$len, $lanes>, $lanes>::new()
-					.digest($source, $out)
-			};
-		}
-		match $n_blocks {
-			1 => arm!(64),
-			2 => arm!(128),
-			3 => arm!(192),
-			4 => arm!(256),
-			5 => arm!(320),
-			6 => arm!(384),
-			7 => arm!(448),
-			8 => arm!(512),
-			9 => arm!(576),
-			10 => arm!(640),
-			11 => arm!(704),
-			12 => arm!(768),
-			13 => arm!(832),
-			14 => arm!(896),
-			15 => arm!(960),
-			16 => arm!(1024),
-			_ => unreachable!("a single chunk has at most CHUNK_LEN / BLOCK_LEN = 16 full blocks"),
-		}
-	}};
-}
-
-/// Portable multi-lane Blake3 digest over `N` messages of `M` bytes each.
+/// Portable multi-lane Blake3 leaf digest over `N` messages, hashed a block at a time.
 ///
-/// The compression runs in pure Rust `[u32; N]` lane loops, left for LLVM to auto-vectorize.
+/// One chunk, so the chaining value stays at counter 0 and needs no CV stack.
+/// Each message is any length up to `CHUNK_LEN`; all `N` lanes must share that length.
+///
+/// A block is compressed only once the next block's first byte arrives, so the trailing block
+/// is deferred to finalization, where it alone carries `CHUNK_END | ROOT`.
 #[derive(Clone)]
-pub struct PortableBlake3MultiDigest<const M: usize, const N: usize> {
-	/// One fixed-size `M`-byte buffer per lane, holding that lane's message until finalization.
-	buffers: [[u8; M]; N],
-	/// Per-lane write cursor: how many bytes each lane's buffer currently holds.
-	filled: [usize; N],
+pub struct PortableBlake3MultiDigest<const N: usize> {
+	/// Running chaining value per lane; seeded from the IV.
+	cv: [[u32; N]; 8],
+	/// The current block being filled, one 64-byte buffer per lane.
+	block: [[u8; BLOCK_LEN]; N],
+	/// Bytes buffered in `block` so far, shared across lanes (all lanes share one length).
+	block_len: usize,
+	/// How many blocks have already been compressed into `cv`.
+	blocks_compressed: usize,
 }
 
-impl<const M: usize, const N: usize> Default for PortableBlake3MultiDigest<M, N> {
+impl<const N: usize> Default for PortableBlake3MultiDigest<N> {
 	fn default() -> Self {
-		// Every lane starts as a zeroed buffer with an empty cursor.
+		// Fresh chaining value at the IV, empty block buffer, nothing compressed yet.
 		Self {
-			buffers: array::from_fn(|_| [0u8; M]),
-			filled: [0; N],
+			cv: broadcast_iv(),
+			block: [[0u8; BLOCK_LEN]; N],
+			block_len: 0,
+			blocks_compressed: 0,
 		}
 	}
 }
 
-impl<const M: usize, const N: usize> MultiDigest<N> for PortableBlake3MultiDigest<M, N> {
+impl<const N: usize> PortableBlake3MultiDigest<N> {
+	/// Compresses the buffered block as a full, non-final block, then empties the buffer.
+	fn compress_full_block(&mut self) {
+		// Only the very first block of the chunk carries CHUNK_START.
+		let flags = if self.blocks_compressed == 0 {
+			CHUNK_START
+		} else {
+			0
+		};
+		let m = load_block_words(&self.block);
+		compress_block(&mut self.cv, &m, 0, BLOCK_LEN as u32, flags);
+		self.blocks_compressed += 1;
+		self.block_len = 0;
+	}
+
+	/// Compresses the trailing block as the chunk root and writes each lane's digest.
+	///
+	/// Runs on a copy of the state, so the hasher itself is left untouched for reset.
+	fn write_root(&self, out: &mut [MaybeUninit<Output<blake3::Hasher>>; N]) {
+		let mut cv = self.cv;
+		let mut block = self.block;
+		// Zero-pad the trailing block's unused tail, so padding never changes the digest.
+		for lane in 0..N {
+			block[lane][self.block_len..].fill(0);
+		}
+		// A single-block message has its only block be both the first and the root block.
+		let start = if self.blocks_compressed == 0 {
+			CHUNK_START
+		} else {
+			0
+		};
+		let m = load_block_words(&block);
+		compress_block(&mut cv, &m, 0, self.block_len as u32, start | CHUNK_END | ROOT);
+
+		// Serialize each lane's eight-word chaining value into its 32-byte digest.
+		for lane in 0..N {
+			let mut digest = [0u8; OUT_LEN];
+			for (w, chunk) in digest.chunks_exact_mut(4).enumerate() {
+				chunk.copy_from_slice(&cv[w][lane].to_le_bytes());
+			}
+			out[lane].write(digest.into());
+		}
+	}
+}
+
+impl<const N: usize> MultiDigest<N> for PortableBlake3MultiDigest<N> {
 	type Digest = blake3::Hasher;
 
 	fn new() -> Self {
@@ -267,33 +262,49 @@ impl<const M: usize, const N: usize> MultiDigest<N> for PortableBlake3MultiDiges
 	}
 
 	fn update(&mut self, data: [&[u8]; N]) {
-		// Append each lane's new bytes at that lane's cursor.
-		for ((buf, filled), chunk) in self
-			.buffers
-			.iter_mut()
-			.zip(self.filled.iter_mut())
-			.zip(data)
-		{
-			buf[*filled..*filled + chunk.len()].copy_from_slice(chunk);
-			*filled += chunk.len();
+		// Per-lane read cursor into this call's input.
+		let mut consumed = [0usize; N];
+		loop {
+			// Bytes still pending this call; all present lanes share one length, so the max drives.
+			let remaining = (0..N)
+				.map(|i| data[i].len() - consumed[i])
+				.max()
+				.unwrap_or(0);
+			if remaining == 0 {
+				break;
+			}
+			// A full buffer with more input to come is a non-final block: compress and empty it.
+			if self.block_len == BLOCK_LEN {
+				self.compress_full_block();
+			}
+			// Fill the block buffer up to one block from the pending input.
+			let take = (BLOCK_LEN - self.block_len).min(remaining);
+			for lane in 0..N {
+				let avail = data[lane].len() - consumed[lane];
+				let n = take.min(avail);
+				self.block[lane][self.block_len..self.block_len + n]
+					.copy_from_slice(&data[lane][consumed[lane]..consumed[lane] + n]);
+				consumed[lane] += n;
+			}
+			self.block_len += take;
 		}
 	}
 
 	fn finalize_into(self, out: &mut [MaybeUninit<Output<Self::Digest>>; N]) {
-		// View each lane's buffer as a fixed `M`-byte block-aligned input.
-		let inputs: [&[u8; M]; N] = array::from_fn(|i| &self.buffers[i]);
-		hash_many_portable(&inputs, out);
+		self.write_root(out);
 	}
 
 	fn finalize_into_reset(&mut self, out: &mut [MaybeUninit<Output<Self::Digest>>; N]) {
-		let inputs: [&[u8; M]; N] = array::from_fn(|i| &self.buffers[i]);
-		hash_many_portable(&inputs, out);
+		self.write_root(out);
 		self.reset();
 	}
 
 	fn reset(&mut self) {
-		// Rewind every lane's cursor; used lanes are refilled to `M` before the next hash.
-		self.filled = [0; N];
+		// Reseed the chaining value and forget the block progress; buffer bytes are overwritten
+		// on the next update, and the trailing block's tail is zero-padded at finalization.
+		self.cv = broadcast_iv();
+		self.block_len = 0;
+		self.blocks_compressed = 0;
 	}
 
 	fn digest(data: [&[u8]; N], out: &mut [MaybeUninit<Output<Self::Digest>>; N]) {
@@ -306,9 +317,9 @@ impl<const M: usize, const N: usize> MultiDigest<N> for PortableBlake3MultiDiges
 /// Parallel Blake3 leaf digest backed by the portable auto-vectorized kernel.
 ///
 /// `LANES` is the batch width handed to the vectorizer.
-/// Leaf size routing matches the SIMD leaf digest:
-/// - A whole number of 64-byte blocks, up to one chunk: batched through the portable kernel.
-/// - Anything else: hashed on its own by the scalar adapter.
+/// Leaf size decides the path:
+/// - Up to one 1024-byte chunk (any length): batched through the portable kernel.
+/// - Larger (multi-chunk): hashed on its own by the scalar adapter, which walks the tree.
 pub struct PortableBlake3ParallelDigest<const LANES: usize>;
 
 impl<const LANES: usize> ParallelDigest for PortableBlake3ParallelDigest<LANES> {
@@ -323,7 +334,8 @@ impl<const LANES: usize> ParallelDigest for PortableBlake3ParallelDigest<LANES> 
 		source: impl IndexedParallelIterator<Item = I>,
 		out: &mut [MaybeUninit<Output<Self::Digest>>],
 	) {
-		// Without a fixed leaf length the batch width is unknown; use the scalar adapter.
+		// Without a fixed leaf length a leaf could exceed one chunk, which the kernel cannot hash.
+		// Fall back to the scalar adapter, which handles any length.
 		ParallelDigestAdapter::<blake3::Hasher>::new().digest(source, out);
 	}
 
@@ -335,14 +347,13 @@ impl<const LANES: usize> ParallelDigest for PortableBlake3ParallelDigest<LANES> 
 	) {
 		// Every leaf serializes to the same fixed byte length.
 		let leaf_len = n_items_per_input * I::Item::BYTE_SIZE;
-		// The kernel needs a positive whole number of 64-byte blocks within one chunk.
-		let n_blocks = leaf_len / BLOCK_LEN;
 
-		if leaf_len.is_multiple_of(BLOCK_LEN) && (1..=CHUNK_LEN / BLOCK_LEN).contains(&n_blocks) {
-			// Turn the runtime block count into a compile-time `M`, then batch it.
-			dispatch_portable_blocks!(n_blocks, LANES, source, out);
+		if leaf_len <= CHUNK_LEN {
+			// One chunk or less, any block structure: batch it through the vectorized kernel.
+			ParallelMultidigestImpl::<PortableBlake3MultiDigest<LANES>, LANES>::new()
+				.digest(source, out);
 		} else {
-			// Sub-block, non-block-multiple, or multi-chunk leaves have no batchable shape.
+			// Multi-chunk leaves need the tree; hand them to the scalar adapter.
 			ParallelDigestAdapter::<blake3::Hasher>::new().digest(source, out);
 		}
 	}
@@ -357,40 +368,65 @@ mod tests {
 
 	use super::*;
 
-	/// Runs `N` equal-length `M`-byte messages through the portable batch and pins each lane to
-	/// the scalar reference.
-	fn check_portable_batch<const M: usize, const N: usize>(rng: &mut StdRng) {
+	/// Runs `N` equal-length messages of `len` bytes through the portable batch and pins each lane
+	/// to the scalar reference.
+	fn check_portable_batch<const N: usize>(rng: &mut StdRng, len: usize) {
 		// Fresh random bytes per lane, so lanes don't share a digest by accident.
 		let messages: [Vec<u8>; N] = array::from_fn(|_| {
-			let mut m = vec![0u8; M];
+			let mut m = vec![0u8; len];
 			rng.fill_bytes(&mut m);
 			m
 		});
 		let refs: [&[u8]; N] = array::from_fn(|i| messages[i].as_slice());
 		let mut out = array::from_fn::<_, N, _>(|_| MaybeUninit::uninit());
-		PortableBlake3MultiDigest::<M, N>::digest(refs, &mut out);
+		PortableBlake3MultiDigest::<N>::digest(refs, &mut out);
 
 		// Each lane's output must equal the single-message reference hash of that lane.
 		for (o, message) in out.iter().zip(messages.iter()) {
 			let got = unsafe { o.assume_init_ref() };
-			assert_eq!(got.as_slice(), blake3::hash(message).as_bytes(), "M = {M}, N = {N}");
+			assert_eq!(got.as_slice(), blake3::hash(message).as_bytes(), "len = {len}, N = {N}");
 		}
 	}
 
 	#[test]
-	fn test_portable_block_multiples_match_reference() {
+	fn test_portable_lengths_match_reference() {
 		let mut rng = StdRng::seed_from_u64(0);
 
-		// Invariant: the portable kernel reproduces blake3::hash for whole-block single chunks.
-		// Each M is a different block count; each N is a different vectorizer width.
-		check_portable_batch::<64, 4>(&mut rng);
-		check_portable_batch::<128, 4>(&mut rng);
-		check_portable_batch::<192, 4>(&mut rng);
-		check_portable_batch::<1024, 4>(&mut rng);
-		check_portable_batch::<64, 8>(&mut rng);
-		check_portable_batch::<512, 8>(&mut rng);
-		check_portable_batch::<64, 16>(&mut rng);
-		check_portable_batch::<1024, 16>(&mut rng);
+		// Invariant: the portable kernel reproduces blake3::hash for any single-chunk length.
+		// Lengths cover every block-structure case within one chunk:
+		// - 0             : the lone empty block.
+		// - 1, 31, 63     : a single sub-block, no full blocks.
+		// - 64, 128, 1024 : exact block multiples.
+		// - 65, 100, 1000 : leading full blocks plus a partial tail.
+		// Three lane widths per length: 4 (NEON), 8, and 16 (the throughput sweet spot).
+		for len in [0, 1, 31, 63, 64, 65, 100, 127, 128, 1000, 1024] {
+			check_portable_batch::<4>(&mut rng, len);
+			check_portable_batch::<8>(&mut rng, len);
+			check_portable_batch::<16>(&mut rng, len);
+		}
+	}
+
+	#[test]
+	fn test_portable_chained_update() {
+		let mut rng = StdRng::seed_from_u64(2);
+		// Four 200-byte messages: three full blocks plus a 8-byte partial tail.
+		let messages: [Vec<u8>; 4] = array::from_fn(|_| {
+			let mut m = vec![0u8; 200];
+			rng.fill_bytes(&mut m);
+			m
+		});
+
+		// Invariant: a message split across two updates hashes the same as one update of the whole.
+		// The 50/150 split lands mid-block, exercising the buffer-fill and deferred-compress paths.
+		let mut hasher = PortableBlake3MultiDigest::<4>::new();
+		hasher.update(array::from_fn(|i| &messages[i][..50]));
+		hasher.update(array::from_fn(|i| &messages[i][50..]));
+		let mut out = array::from_fn::<_, 4, _>(|_| MaybeUninit::uninit());
+		hasher.finalize_into(&mut out);
+
+		for (o, message) in out.iter().zip(messages.iter()) {
+			assert_eq!(unsafe { o.assume_init_ref() }.as_slice(), blake3::hash(message).as_bytes());
+		}
 	}
 
 	#[test]
@@ -421,11 +457,11 @@ mod tests {
 		};
 
 		// Invariant: every leaf size reproduces the reference, on the batch or the adapter route.
-		// - 0, 1, 63    : sub-block            -> adapter.
-		// - 65, 100     : non-block-multiple   -> adapter.
-		// - 2048        : multi-chunk          -> adapter.
-		// - 64, 256     : whole blocks         -> portable batch.
-		for leaf_len in [0, 1, 63, 64, 65, 100, 256, 2048] {
+		// - 0, 1, 63      : sub-block             -> portable batch.
+		// - 65, 100, 1000 : partial trailing block -> portable batch.
+		// - 64, 1024      : whole blocks           -> portable batch.
+		// - 1025, 2048    : multi-chunk (> 1024)   -> scalar adapter.
+		for leaf_len in [0, 1, 63, 64, 65, 100, 1000, 1024, 1025, 2048] {
 			check(leaf_len);
 		}
 	}

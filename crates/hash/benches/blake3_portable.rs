@@ -20,10 +20,11 @@ const DATA_LEN: usize = 1 << 20; // 1 MiB
 /// Number of 16-byte field elements in the input.
 const N_ELEMS: usize = DATA_LEN / std::mem::size_of::<B128>();
 
-/// Leaf sizes measured, in 16-byte field elements: byte lengths 64, 128, 256, 512, 1024.
+/// Leaf sizes measured, in 16-byte field elements: byte lengths 16, 32, 48, 64, 128, ..., 1024.
 ///
-/// All are whole-block single chunks, so all take the portable batch path.
-const BATCH_SIZES: [usize; 5] = [4, 8, 16, 32, 64];
+/// Sizes span sub-block (16, 32, 48), whole-block, and multi-block leaves within one chunk.
+/// All take the portable batch path, including the sub-block sizes the crate kernel could not.
+const BATCH_SIZES: [usize; 8] = [1, 2, 3, 4, 8, 16, 32, 64];
 
 /// Hashes the 1 MiB pool folded into `batch_size`-element leaves with the given parallel digest.
 fn run<D: ParallelDigest<Digest = blake3::Hasher>>(

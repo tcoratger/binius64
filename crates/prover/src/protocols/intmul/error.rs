@@ -1,8 +1,7 @@
 // Copyright 2025 Irreducible Inc.
 
+use binius_ip_prover::{prodcheck::ProdcheckError, sumcheck::SumcheckError};
 use binius_transcript::TranscriptError;
-
-use crate::protocols::{prodcheck::ProdcheckError, sumcheck::SumcheckError};
 
 #[derive(thiserror::Error, Debug)]
 pub enum IntMulError {

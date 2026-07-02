@@ -1,10 +1,10 @@
 // Copyright 2025 Irreducible Inc.
 
+use binius_iop_prover::basefold::BaseFoldError;
+use binius_ip_prover::sumcheck::SumcheckError;
 use binius_transcript::TranscriptError;
 
-use crate::protocols::{
-	basefold::BaseFoldError, intmul::IntMulError, shift::ShiftError, sumcheck::SumcheckError,
-};
+use crate::protocols::{intmul::IntMulError, shift::ShiftError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

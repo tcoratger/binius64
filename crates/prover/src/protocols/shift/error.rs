@@ -1,6 +1,6 @@
 // Copyright 2025 Irreducible Inc.
 
-use crate::protocols::sumcheck::SumcheckError;
+use binius_ip_prover::sumcheck::SumcheckError;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ShiftError {

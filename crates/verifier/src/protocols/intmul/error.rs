@@ -1,9 +1,7 @@
 // Copyright 2025 Irreducible Inc.
 
-use binius_ip::{channel::IPChannelError, sumcheck::SumcheckError};
+use binius_ip::{channel::IPChannelError, prodcheck::ProdcheckError, sumcheck::SumcheckError};
 use binius_transcript::TranscriptError;
-
-use crate::protocols::prodcheck::ProdcheckError;
 
 #[derive(thiserror::Error, Debug)]
 pub enum IntMulError {

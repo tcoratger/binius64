@@ -3,7 +3,7 @@
 use binius_circuits::sha256::Sha256;
 use binius_core::{
 	constraint_system::{AndConstraint, ConstraintSystem, MulConstraint, ValueVec},
-	verify::{eval_operand, verify_constraints},
+	verify::verify_constraints,
 	word::Word,
 };
 use binius_field::{AESTowerField8b, BinaryField};
@@ -134,9 +134,9 @@ pub fn compute_bitand_images(constraints: &[AndConstraint], witness: &ValueVec) 
 	let (a_image, b_image, c_image) = constraints
 		.iter()
 		.map(|constraint| {
-			let a = eval_operand(witness, &constraint.a);
-			let b = eval_operand(witness, &constraint.b);
-			let c = eval_operand(witness, &constraint.c);
+			let a = witness.eval_operand(&constraint.a);
+			let b = witness.eval_operand(&constraint.b);
+			let c = witness.eval_operand(&constraint.c);
 			(a, b, c)
 		})
 		.multiunzip();
@@ -148,10 +148,10 @@ fn compute_intmul_images(constraints: &[MulConstraint], witness: &ValueVec) -> [
 	let (a_image, b_image, hi_image, lo_image) = constraints
 		.iter()
 		.map(|constraint| {
-			let a = eval_operand(witness, &constraint.a);
-			let b = eval_operand(witness, &constraint.b);
-			let hi = eval_operand(witness, &constraint.hi);
-			let lo = eval_operand(witness, &constraint.lo);
+			let a = witness.eval_operand(&constraint.a);
+			let b = witness.eval_operand(&constraint.b);
+			let hi = witness.eval_operand(&constraint.hi);
+			let lo = witness.eval_operand(&constraint.lo);
 			(a, b, hi, lo)
 		})
 		.multiunzip();

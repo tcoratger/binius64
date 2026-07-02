@@ -3,32 +3,31 @@
 
 use binius_field::{Field, PackedField};
 use binius_ip::sumcheck::RoundCoeffs;
-use binius_math::{AsSlicesMut, FieldSliceMut, multilinear::fold::fold_highest_var_inplace};
-use binius_utils::rayon::prelude::*;
+use binius_math::AsSlicesMut;
 
 use super::{
-	common::SumcheckProver, error::Error, gruen32::Gruen32, round_evals::WideRoundEvals2,
-	round_state::RoundState,
+	batch_quadratic_mle::{BatchQuadraticMleCheckProver, QuadraticComposition},
+	common::{MleCheckProver, SumcheckProver},
+	error::Error,
 };
-use crate::sumcheck::common::MleCheckProver;
 
-/// MLE-check prover for polynomials defined as quadratic compositions of N multilinear polynomials.
+/// MLE-check prover for a quadratic composition of `N` multilinear polynomials.
 ///
-/// This prover implements the MLE (multilinear extension) check protocol. Given N multilinear
-/// polynomials M₁, M₂, ..., Mₙ and a quadratic composition function C, it proves claims about
-/// the multilinear extension of the composite polynomial C(M₁, M₂, ..., Mₙ).
+/// It proves a claim about the multilinear extension of the composite `C(M_1, ..., M_N)`.
+/// The claim is reduced to a claim on each multilinear's evaluation at the challenge point.
+/// Round polynomials are degree 2, interpolated with the Karatsuba optimization.
 ///
-/// The prover uses the sumcheck protocol to reduce claims about this multilinear extension
-/// to claims about the individual multilinear evaluations, employing the Karatsuba optimization
-/// for efficient degree-2 polynomial interpolation.
-pub struct QuadraticMleCheckProver<P: PackedField, Composition, InfinityComposition, const N: usize>
-{
-	multilinears: Box<dyn AsSlicesMut<P, N> + Send>,
-	composition: Composition,
-	infinity_composition: InfinityComposition,
-	last_coeffs_or_eval: RoundState<RoundCoeffs<P::Scalar>, P::Scalar>,
-	gruen32: Gruen32<P>,
-}
+/// This is the single-claim specialization of [`BatchQuadraticMleCheckProver`].
+/// It runs one claim through the same chunked, wide-accumulated round evaluation.
+pub struct QuadraticMleCheckProver<P: PackedField, Composition, InfinityComposition, const N: usize>(
+	BatchQuadraticMleCheckProver<
+		P,
+		SingleComposition<Composition>,
+		SingleComposition<InfinityComposition>,
+		N,
+		1,
+	>,
+);
 
 impl<F, P, Composition, InfinityComposition, const N: usize>
 	QuadraticMleCheckProver<P, Composition, InfinityComposition, N>
@@ -38,75 +37,36 @@ where
 	Composition: Fn([P; N]) -> P + Sync,
 	InfinityComposition: Fn([P; N]) -> P + Sync,
 {
-	/// Creates a new prover for verifying quadratic composite polynomial evaluations.
+	/// Creates a new prover for verifying a quadratic composite polynomial evaluation.
 	///
 	/// # Arguments
 	///
-	/// * `multilinears` - Array of N multilinear polynomials that serve as inputs to the
-	///   composition. Each multilinear must have the same number of variables.
-	///
-	/// * `composition` - Function for evaluating the N-variate quadratic composition over packed
-	///   field elements. Takes an array of N packed field elements (one from each multilinear) and
-	///   returns their composition value. For example, for a product of two multilinears, this
-	///   would compute `M₁(X) * M₂(X)`.
-	///
-	/// * `infinity_composition` - Polynomial evaluator that computes only the highest-degree terms
-	///   of the composition. This is used for evaluation at the "infinity point" in the Karatsuba
-	///   optimization, where we take the limit of P(X)/X^d as X approaches infinity. This limit
-	///   equals the coefficient of the highest-degree term, effectively ignoring lower-degree
-	///   terms. For example, if composition is `a*b - c`, the infinity_composition would be just
-	///   `a*b`.
-	///
-	/// * `eval_point` - The point at which the multilinear extension is being evaluated. Must have
-	///   length equal to the number of variables in the multilinears.
-	///
-	/// * `eval_claim` - The claimed value of the multilinear extension of the composite polynomial
-	///   at the evaluation point. This is the multilinear extension of the function that maps v ∈
-	///   {0,1}ⁿ to C(M₁(v), M₂(v), ..., Mₙ(v)), evaluated at eval_point.
-	///
-	/// # Returns
-	///
-	/// A configured prover instance ready to execute the sumcheck protocol.
+	/// * `multilinears` - the `N` input multilinears, all with the same number of variables.
+	/// * `composition` - evaluates `C` on one packed row of the inputs, e.g. `|[a, b]| a * b`.
+	/// * `infinity_composition` - the highest-degree part of `C`, e.g. `a * b` for `a * b - c`.
+	/// * `eval_point` - the point at which the composite's multilinear extension is claimed.
+	/// * `eval_claim` - the claimed value of that extension at `eval_point`.
 	///
 	/// # Errors
 	///
-	/// Returns `Error::MultilinearSizeMismatch` if any multilinear has a different number of
-	/// variables than the length of `eval_point`.
+	/// Returns [`Error::MultilinearSizeMismatch`] if a multilinear's variable count differs from
+	/// the length of `eval_point`.
 	pub fn new(
-		mut multilinears: impl AsSlicesMut<P, N> + Send + 'static,
+		multilinears: impl AsSlicesMut<P, N> + Send + 'static,
 		composition: Composition,
 		infinity_composition: InfinityComposition,
 		eval_point: Vec<F>,
 		eval_claim: F,
 	) -> Result<Self, Error> {
-		let n_vars = eval_point.len();
-
-		for multilinear in &multilinears.as_slices_mut() {
-			if multilinear.log_len() != n_vars {
-				return Err(Error::MultilinearSizeMismatch);
-			}
-		}
-
-		let last_coeffs_or_eval = RoundState::Claim(eval_claim);
-		let gruen32 = Gruen32::new(&eval_point);
-
-		Ok(Self {
-			multilinears: Box::new(multilinears),
-			composition,
-			infinity_composition,
-			last_coeffs_or_eval,
-			gruen32,
-		})
-	}
-
-	/// Gets mutable slices of the multilinears, truncated to the current number of variables.
-	fn multilinears_mut(&mut self) -> [FieldSliceMut<'_, P>; N] {
-		let n_vars = self.gruen32.n_vars_remaining();
-		let mut slices = self.multilinears.as_slices_mut();
-		for slice in &mut slices {
-			slice.truncate(n_vars);
-		}
-		slices
+		// Reuse the batch prover with a single claim.
+		let inner = BatchQuadraticMleCheckProver::new(
+			multilinears,
+			SingleComposition(composition),
+			SingleComposition(infinity_composition),
+			eval_point,
+			[eval_claim],
+		)?;
+		Ok(Self(inner))
 	}
 }
 
@@ -119,119 +79,33 @@ where
 	InfinityComposition: Fn([P; N]) -> P + Sync,
 {
 	fn n_vars(&self) -> usize {
-		self.gruen32.n_vars_remaining()
+		// Variables left to bind, tracked by the underlying batch prover.
+		self.0.n_vars()
 	}
 
 	fn n_claims(&self) -> usize {
-		1
+		// A single claim.
+		self.0.n_claims()
 	}
 
 	fn round_claim(&self) -> Vec<F> {
-		let claim = match &self.last_coeffs_or_eval {
-			RoundState::Claim(eval) => *eval,
-			RoundState::Coeffs(coeffs) => {
-				coeffs.lerp_over_endpoints(self.gruen32.next_coordinate())
-			}
-		};
-		vec![claim]
+		// The one claim carried into this round.
+		self.0.round_claim()
 	}
 
 	fn execute(&mut self) -> Result<Vec<RoundCoeffs<F>>, Error> {
-		let last_eval = *self.last_coeffs_or_eval.claim()?;
-
-		let n_vars_remaining = self.gruen32.n_vars_remaining();
-		assert!(n_vars_remaining > 0);
-
-		let eq_expansion = self.gruen32.eq_expansion();
-		assert_eq!(eq_expansion.log_len(), n_vars_remaining - 1);
-
-		// Get references to compositions - these don't conflict with multilinears borrow
-		let composition = &self.composition;
-		let infinity_composition = &self.infinity_composition;
-
-		// Get multilinear slices and truncate to current n_vars
-		let mut multilinears = self.multilinears.as_slices_mut();
-		for slice in &mut multilinears {
-			slice.truncate(n_vars_remaining);
-		}
-
-		// Split each multilinear in half
-		let (splits_0, splits_1) = multilinears
-			.iter()
-			.map(|multilinear| multilinear.split_half_ref())
-			.unzip::<_, _, Vec<_>, Vec<_>>();
-
-		// Compute F(1) and F(∞) where F = ∑_{v ∈ B} C(M_1(v || X), ..., M_N(v || X)) eq(v, z).
-		// We need to iterate over all positions in parallel.
-		//
-		// The per-position products `C(..) * eq_i` are accumulated in unreduced (wide) form and
-		// reduced a single time at the end, which amortizes the GF(2^128) reduction across all
-		// hypercube points.
-		let round_evals = eq_expansion
-			.as_ref()
-			.into_par_iter()
-			.enumerate()
-			.map(|(i, &eq_i)| {
-				// Collect evaluations at 1 and ∞ for each multilinear
-				let mut evals_1 = [P::default(); N];
-				let mut evals_inf = [P::default(); N];
-				for j in 0..N {
-					evals_1[j] = splits_1[j].as_ref()[i];
-					evals_inf[j] = splits_0[j].as_ref()[i] + splits_1[j].as_ref()[i];
-				}
-
-				WideRoundEvals2 {
-					// Evaluate composition at X=1
-					y_1: P::wide_mul(composition(evals_1), eq_i),
-					// Evaluate composition at X=∞ (where M(∞) = M(0) + M(1))
-					y_inf: P::wide_mul(infinity_composition(evals_inf), eq_i),
-				}
-			})
-			.reduce(WideRoundEvals2::default, |lhs, rhs| lhs + rhs)
-			.reduce::<P>()
-			.sum_scalars(n_vars_remaining - 1);
-
-		let alpha = self.gruen32.next_coordinate();
-		let round_coeffs = round_evals.interpolate_eq(last_eval, alpha);
-
-		self.last_coeffs_or_eval = RoundState::Coeffs(round_coeffs.clone());
-		Ok(vec![round_coeffs])
+		// The single round polynomial for the variable being bound.
+		self.0.execute()
 	}
 
 	fn fold(&mut self, challenge: F) -> Result<(), Error> {
-		let coeffs = self.last_coeffs_or_eval.coeffs()?;
-
-		assert!(
-			self.n_vars() > 0,
-			"n_vars is decremented in fold; \
-			fold changes last_coeffs_or_eval to Eval variant; \
-			fold only executes with Coeffs variant; \
-			thus, n_vars should be > 0"
-		);
-
-		let eval = coeffs.evaluate(challenge);
-
-		for multilinear in &mut self.multilinears_mut() {
-			fold_highest_var_inplace(multilinear, challenge);
-		}
-
-		self.gruen32.fold(challenge);
-		self.last_coeffs_or_eval = RoundState::Claim(eval);
-		Ok(())
+		// Bind the current variable to the verifier challenge.
+		self.0.fold(challenge)
 	}
 
-	fn finish(mut self) -> Result<Vec<F>, Error> {
-		if self.n_vars() > 0 {
-			return Err(self.last_coeffs_or_eval.unfinished_err());
-		}
-
-		let multilinear_evals = self
-			.multilinears_mut()
-			.into_iter()
-			.map(|multilinear| multilinear.get(0))
-			.collect();
-
-		Ok(multilinear_evals)
+	fn finish(self) -> Result<Vec<F>, Error> {
+		// The N multilinear evaluations at the challenge point.
+		self.0.finish()
 	}
 }
 
@@ -244,7 +118,22 @@ where
 	InfinityComposition: Fn([P; N]) -> P + Sync,
 {
 	fn eval_point(&self) -> &[F] {
-		&self.gruen32.eval_point()[..self.n_vars()]
+		// The remaining coordinates of the evaluation point.
+		self.0.eval_point()
+	}
+}
+
+/// Adapts a single-output composition into the [`QuadraticComposition`] shape with `M = 1`.
+struct SingleComposition<C>(C);
+
+impl<P, C, const N: usize> QuadraticComposition<P, N, 1> for SingleComposition<C>
+where
+	P: PackedField,
+	C: Fn([P; N]) -> P,
+{
+	fn evaluate(&self, inputs: [P; N], outputs: &mut [P; 1]) {
+		// The single composite value is the only output.
+		outputs[0] = (self.0)(inputs);
 	}
 }
 

@@ -21,11 +21,11 @@ where
 {
 	BatchQuadraticMleCheckProver::new(
 		fraction,
-		|[num_a, num_b, den_a, den_b], out| {
+		|[num_a, num_b, den_a, den_b]: [P; 4], out: &mut [P; 2]| {
 			out[0] = num_a * den_b + num_b * den_a;
 			out[1] = den_a * den_b;
 		},
-		|[num_a, num_b, den_a, den_b], out| {
+		|[num_a, num_b, den_a, den_b]: [P; 4], out: &mut [P; 2]| {
 			// The fractional addition formulas are purely quadratic, so the infinity composition
 			// matches the regular composition.
 			out[0] = num_a * den_b + num_b * den_a;

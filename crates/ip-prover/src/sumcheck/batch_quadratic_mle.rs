@@ -18,6 +18,26 @@ use crate::sumcheck::{
 	round_state::RoundState,
 };
 
+/// Produces the composite value of each of the `M` claims for one packed row of `N` inputs.
+///
+/// Evaluating all claims together lets those that share sub-expressions reuse the work.
+/// A closure of type `Fn([P; N], &mut [P; M])` implements this directly.
+pub trait QuadraticComposition<P: PackedField, const N: usize, const M: usize> {
+	/// Writes the `M` composite values for the given inputs into `outputs`.
+	fn evaluate(&self, inputs: [P; N], outputs: &mut [P; M]);
+}
+
+impl<P, T, const N: usize, const M: usize> QuadraticComposition<P, N, M> for T
+where
+	P: PackedField,
+	T: Fn([P; N], &mut [P; M]),
+{
+	fn evaluate(&self, inputs: [P; N], outputs: &mut [P; M]) {
+		// A closure that already has the right shape is its own evaluator.
+		self(inputs, outputs)
+	}
+}
+
 /// Batch MLE-check prover for M quadratic compositions over N multilinears.
 ///
 /// This prover runs a single sumcheck instance that amortizes the work of M independent
@@ -48,8 +68,8 @@ impl<F, P, Composition, InfinityComposition, const N: usize, const M: usize>
 where
 	F: Field,
 	P: PackedField<Scalar = F>,
-	Composition: Fn([P; N], &mut [P; M]) + Sync,
-	InfinityComposition: Fn([P; N], &mut [P; M]) + Sync,
+	Composition: QuadraticComposition<P, N, M> + Sync,
+	InfinityComposition: QuadraticComposition<P, N, M> + Sync,
 {
 	pub fn new(
 		mut multilinears: impl AsSlicesMut<P, N> + Send + 'static,
@@ -100,8 +120,8 @@ impl<F, P, Composition, InfinityComposition, const N: usize, const M: usize> Sum
 where
 	F: Field,
 	P: PackedField<Scalar = F>,
-	Composition: Fn([P; N], &mut [P; M]) + Sync,
-	InfinityComposition: Fn([P; N], &mut [P; M]) + Sync,
+	Composition: QuadraticComposition<P, N, M> + Sync,
+	InfinityComposition: QuadraticComposition<P, N, M> + Sync,
 {
 	fn n_vars(&self) -> usize {
 		self.gruen32.n_vars_remaining()
@@ -206,8 +226,8 @@ where
 					}
 
 					// Apply the compositions for this equality term.
-					comp(evals_1, &mut y_1_scratch);
-					inf_comp(evals_inf, &mut y_inf_scratch);
+					comp.evaluate(evals_1, &mut y_1_scratch);
+					inf_comp.evaluate(evals_inf, &mut y_inf_scratch);
 
 					for i in 0..M {
 						// Weight by eq indicator to keep the sumcheck claim aligned to
@@ -309,8 +329,8 @@ impl<F, P, Composition, InfinityComposition, const N: usize, const M: usize> Mle
 where
 	F: Field,
 	P: PackedField<Scalar = F>,
-	Composition: Fn([P; N], &mut [P; M]) + Sync,
-	InfinityComposition: Fn([P; N], &mut [P; M]) + Sync,
+	Composition: QuadraticComposition<P, N, M> + Sync,
+	InfinityComposition: QuadraticComposition<P, N, M> + Sync,
 {
 	fn eval_point(&self) -> &[F] {
 		&self.gruen32.eval_point()[..self.n_vars()]

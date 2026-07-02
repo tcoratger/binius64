@@ -13,7 +13,7 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use binius_field::BinaryField;
+use binius_field::{BinaryField, util::FieldFn};
 use binius_iop::{
 	basefold_channel::{BaseFoldOracle, BaseFoldVerifierChannel},
 	channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec},
@@ -111,7 +111,8 @@ where
 			"outer private/mask oracle specs must be the final suffix of channel specs"
 		);
 
-		let precommit_oracle = inner_channel.recv_oracle()?;
+		let precommit_oracle =
+			inner_channel.recv_oracle(outer_oracle_specs[0].log_msg_len, true)?;
 
 		Ok(Self {
 			inner_channel,
@@ -213,12 +214,8 @@ where
 		}
 	}
 
-	fn compute_public_value(
-		&mut self,
-		inputs: &[Self::Elem],
-		f: impl FnOnce(&[F]) -> F,
-	) -> Self::Elem {
-		// The closure's result enters as a single derived public wire (matching the symbolic
+	fn compute_public_value(&mut self, inputs: &[Self::Elem], f: impl FieldFn<F>) -> Self::Elem {
+		// The function's result enters as a single derived public wire (matching the symbolic
 		// builder's `hint_varsize`), whose value the verifier computes natively from the
 		// public-derived inputs. See `IronSpartanBuilderChannel::compute_public_value`.
 		let out_wire = {
@@ -227,7 +224,7 @@ where
 				.iter()
 				.map(|elem| elem.to_wire(&mut instance_gen))
 				.collect();
-			instance_gen.hint_varsize(&input_wires, 1, move |vals| vec![f(vals)])[0]
+			instance_gen.hint_varsize(&input_wires, 1, move |vals| vec![f.call::<F>(vals)])[0]
 		};
 		CircuitElem::wire(&self.instance_gen, out_wire)
 	}
@@ -248,12 +245,17 @@ where
 		&all[..n_remaining_inner]
 	}
 
-	fn recv_oracle(&mut self) -> Result<Self::Oracle, binius_iop::channel::Error> {
+	fn recv_oracle(
+		&mut self,
+		log_msg_len: usize,
+		is_witness_dependent: bool,
+	) -> Result<Self::Oracle, binius_iop::channel::Error> {
 		assert!(
 			!self.remaining_oracle_specs().is_empty(),
 			"recv_oracle called but no remaining inner oracle specs"
 		);
-		self.inner_channel.recv_oracle()
+		self.inner_channel
+			.recv_oracle(log_msg_len, is_witness_dependent)
 	}
 
 	fn verify_oracle_relations(

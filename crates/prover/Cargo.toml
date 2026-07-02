@@ -11,6 +11,7 @@ workspace = true
 binius-core = { path = "../core" }
 binius-field = { path = "../field" }
 binius-hash = { path = "../hash" }
+binius-ip = { path = "../ip" }
 binius-iop = { path = "../iop" }
 binius-iop-prover = { path = "../iop-prover", default-features = false }
 binius-ip-prover = { path = "../ip-prover", default-features = false }
@@ -70,6 +71,10 @@ name = "fold_words"
 harness = false
 
 [[bench]]
+name = "fold_across_words"
+harness = false
+
+[[bench]]
 name = "ring_switch"
 harness = false
 
@@ -82,5 +87,5 @@ name = "fracaddcheck"
 harness = false
 
 [features]
-default = ["rayon"]
+default = []
 rayon = ["binius-utils/rayon"]

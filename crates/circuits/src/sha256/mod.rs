@@ -360,7 +360,7 @@ impl Sha256 {
 	}
 
 	/// Returns the maximum message length, in bytes.
-	pub fn max_len_bytes(&self) -> usize {
+	pub const fn max_len_bytes(&self) -> usize {
 		self.message.len() << (LOG_WORD_SIZE_BITS - LOG_BYTE_BITS)
 	}
 
@@ -592,7 +592,7 @@ pub fn sha256_fixed(builder: &CircuitBuilder, message: &[Wire], len_bytes: usize
 
 			sha256_compress(
 				&builder.subcircuit(format!("sha256_fixed_compress[{}]", block_idx)),
-				state.clone(),
+				state,
 				block_message,
 			)
 		},

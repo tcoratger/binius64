@@ -161,21 +161,22 @@ fn test_zk_wrapped_prove_verify() {
 	);
 
 	// Observe public input through the wrapped channel.
-	(&mut wrapped_prover_channel).observe_many(&public);
+	wrapped_prover_channel.observe_many(&public);
 
 	// Commit the inner precommit oracle on the wrapped channel, then run the inner proof.
-	// Bind a &mut to the wrapped channel so that `Channel` in commit_precommit/prove is
-	// inferred as `&mut ZKWrappedProverChannel` — the type that implements IOPProverChannel.
-	let mut channel_ref = &mut wrapped_prover_channel;
 	let (inner_precommit_oracle, inner_precommit_packed) = inner_iop_prover
-		.commit_precommit::<OptimalPackedB128, _>(&inner_witness, &mut rng, &mut channel_ref);
+		.commit_precommit::<OptimalPackedB128, _>(
+			&inner_witness,
+			&mut rng,
+			&mut wrapped_prover_channel,
+		);
 	inner_iop_prover
 		.prove::<OptimalPackedB128, _>(
 			inner_witness,
 			inner_precommit_oracle,
 			inner_precommit_packed,
 			&mut rng,
-			&mut channel_ref,
+			&mut wrapped_prover_channel,
 		)
 		.expect("inner prove failed");
 
@@ -199,7 +200,9 @@ fn test_zk_wrapped_prove_verify() {
 	let inner_public_elems = wrapped_verifier_channel.observe_many(&public);
 
 	// Run the inner IOP verify through the wrapped channel.
-	let inner_precommit_oracle = wrapped_verifier_channel.recv_oracle().unwrap();
+	let inner_precommit_oracle = wrapped_verifier_channel
+		.recv_oracle(outer_oracle_specs[0].log_msg_len, true)
+		.unwrap();
 	inner_iop_verifier
 		.verify(inner_precommit_oracle, inner_public_elems, &mut wrapped_verifier_channel)
 		.expect("inner IOP verify failed");

@@ -1,5 +1,5 @@
 [package]
-name = "binius-m4"
+name = "binius-m4-verifier"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -10,19 +10,10 @@ workspace = true
 [dependencies]
 binius-core = { path = "../core" }
 binius-field = { path = "../field" }
-binius-frontend = { path = "../frontend" }
+binius-hash = { path = "../hash" }
 binius-iop = { path = "../iop" }
-binius-iop-prover = { path = "../iop-prover" }
+binius-ip = { path = "../ip" }
 binius-math = { path = "../math" }
+binius-transcript = { path = "../transcript" }
 binius-utils = { path = "../utils" }
 binius-verifier = { path = "../verifier" }
-
-[dev-dependencies]
-binius-prover = { path = "../prover" }
-binius-transcript = { path = "../transcript" }
-proptest = { workspace = true }
-rand = { workspace = true }
-
-[features]
-default = ["rayon"]
-rayon = ["binius-utils/rayon"]

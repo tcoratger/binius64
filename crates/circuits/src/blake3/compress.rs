@@ -316,7 +316,7 @@ impl Hint for Blake3CompressHint {
 //
 // Shared by [`Blake3CompressHint`] (prover-side witness generation) and the tests.
 
-fn ref_g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
+const fn ref_g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
 	v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
 	v[d] = (v[d] ^ v[a]).rotate_right(16);
 	v[c] = v[c].wrapping_add(v[d]);
@@ -327,7 +327,7 @@ fn ref_g(v: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my:
 	v[b] = (v[b] ^ v[c]).rotate_right(7);
 }
 
-fn ref_round(state: &mut [u32; 16], msg: &[u32; 16], round: usize) {
+const fn ref_round(state: &mut [u32; 16], msg: &[u32; 16], round: usize) {
 	let schedule = MSG_SCHEDULE[round];
 
 	ref_g(state, 0, 4, 8, 12, msg[schedule[0]], msg[schedule[1]]);
@@ -341,7 +341,11 @@ fn ref_round(state: &mut [u32; 16], msg: &[u32; 16], round: usize) {
 	ref_g(state, 3, 4, 9, 14, msg[schedule[14]], msg[schedule[15]]);
 }
 
-fn ref_compress(
+/// Pure-Rust BLAKE3 compression, matching the in-circuit compression exactly.
+///
+/// - Exposed for callers that use a raw 2-to-1 compression as a tweakable hash.
+/// - It reproduces the same value off-circuit for witness generation.
+pub fn ref_compress(
 	cv: &[u32; 8],
 	block: &[u32; 16],
 	counter: u64,

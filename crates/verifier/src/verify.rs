@@ -1,4 +1,5 @@
 // Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 
 use binius_core::{constraint_system::ConstraintSystem, word::Word};
 use binius_field::{AESTowerField8b as B8, BinaryField, ExtensionField, FieldOps};
@@ -6,6 +7,7 @@ use binius_hash::binary_merkle_tree::HashSuite;
 use binius_iop::{
 	basefold_compiler::BaseFoldVerifierCompiler,
 	channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec},
+	oracle_setup_channel::OracleSetupChannel,
 };
 use binius_ip::channel::IPVerifierChannel;
 use binius_math::{
@@ -55,7 +57,7 @@ impl IOPVerifier {
 	///
 	/// The constraint system must already be validated via
 	/// [`ConstraintSystem::validate_and_prepare`].
-	pub fn new(constraint_system: ConstraintSystem, log_public_words: usize) -> Self {
+	pub const fn new(constraint_system: ConstraintSystem, log_public_words: usize) -> Self {
 		Self {
 			constraint_system,
 			log_public_words,
@@ -63,7 +65,7 @@ impl IOPVerifier {
 	}
 
 	/// Returns the constraint system.
-	pub fn constraint_system(&self) -> &ConstraintSystem {
+	pub const fn constraint_system(&self) -> &ConstraintSystem {
 		&self.constraint_system
 	}
 
@@ -73,7 +75,7 @@ impl IOPVerifier {
 	}
 
 	/// Returns log2 of the number of public constants and input/output words.
-	pub fn log_public_words(&self) -> usize {
+	pub const fn log_public_words(&self) -> usize {
 		self.log_public_words
 	}
 
@@ -96,13 +98,18 @@ impl IOPVerifier {
 	/// `is_zk` is the protocol-level zero-knowledge flag: in a ZK proof the witness oracle is
 	/// masked, in a transparent proof it is not. The flag is taken per call so that a non-ZK
 	/// oracle can still participate in a ZK protocol (e.g. indexed relation openings).
+	///
+	/// The specs are derived by running [`Self::verify`] against an [`OracleSetupChannel`], which
+	/// records each oracle received (via `recv_oracle`) without performing any real verification.
+	/// This keeps the spec sequence automatically in lockstep with the `recv_oracle` calls in
+	/// `verify`, rather than duplicating it here.
 	pub fn oracle_specs(&self, is_zk: bool) -> Vec<OracleSpec> {
-		let log_msg_len = self.log_witness_elems();
-		vec![if is_zk {
-			OracleSpec::new_zk(log_msg_len)
-		} else {
-			OracleSpec::new(log_msg_len)
-		}]
+		let mut channel = OracleSetupChannel::new(is_zk);
+		let public = vec![Word::ZERO; 1 << self.log_public_words()];
+		// The result is discarded: the setup channel performs no real verification (all `recv_*`
+		// return zero, `assert_zero` is a no-op), so we only read back the recorded oracle specs.
+		let _ = self.verify(&public, &mut channel);
+		channel.into_oracle_specs()
 	}
 
 	/// Verifies a proof using an IOP channel.
@@ -133,9 +140,20 @@ impl IOPVerifier {
 		let extended_subspace = subfield_subspace.reduce_dim(LOG_WORD_SIZE_BITS + 1);
 		let domain_subspace = extended_subspace.reduce_dim(LOG_WORD_SIZE_BITS);
 
-		// Receive the trace oracle commitment via channel.
-		let trace_oracle = channel.recv_oracle()?;
+		// Receive the trace oracle commitment via channel. The trace is the witness, so it is
+		// witness-dependent (masked in a ZK proof).
+		let trace_oracle = channel.recv_oracle(self.log_witness_elems(), true)?;
 
+		// SOUNDNESS: the IntMul reduction must run *before* the BitAnd reduction. The BitAnd
+		// reduction samples the univariate challenge `r_zhat_prime` (the `channel.sample()` in
+		// `bitand::verify_with_channel`), and the IntMul per-bit `a`/`b`/`c_lo`/`c_hi` evaluations
+		// are collapsed at that point via the Lagrange weights `l_tilde(r_zhat_prime)` below. Those
+		// evaluations are bound to the transcript while the IntMul reduction runs, so they must be
+		// committed *before* `r_zhat_prime` is drawn; otherwise a malicious prover could choose
+		// them adaptively as a function of `r_zhat_prime` and satisfy the collapsed claim without
+		// a valid witness. Do not reorder these two reductions, and keep the same order in
+		// `prover::prove`.
+		//
 		// [phase] Verify IntMul Reduction - multiplication constraint verification
 		let intmul_guard = tracing::info_span!(
 			"[phase] Verify IntMul Reduction",
@@ -333,7 +351,7 @@ where
 	}
 
 	/// Returns a reference to the IOP verifier.
-	pub fn iop_verifier(&self) -> &IOPVerifier {
+	pub const fn iop_verifier(&self) -> &IOPVerifier {
 		&self.iop_verifier
 	}
 
@@ -353,27 +371,29 @@ where
 	}
 
 	/// Returns the constraint system.
-	pub fn constraint_system(&self) -> &ConstraintSystem {
+	pub const fn constraint_system(&self) -> &ConstraintSystem {
 		self.iop_verifier.constraint_system()
 	}
 
 	/// Returns the chosen FRI parameters.
-	pub fn fri_params(&self) -> &FRIParams<B128> {
+	pub const fn fri_params(&self) -> &FRIParams<B128> {
 		self.iop_compiler.fri_params()
 	}
 
 	/// Returns the [`crate::merkle_tree::MerkleTreeScheme`] instance used.
-	pub fn merkle_scheme(&self) -> &BinaryMerkleTreeScheme<B128, H> {
+	pub const fn merkle_scheme(&self) -> &BinaryMerkleTreeScheme<B128, H> {
 		self.iop_compiler.merkle_scheme()
 	}
 
 	/// Returns log2 of the number of public constants and input/output words.
-	pub fn log_public_words(&self) -> usize {
+	pub const fn log_public_words(&self) -> usize {
 		self.iop_verifier.log_public_words()
 	}
 
 	/// Returns the IOP compiler for creating verifier channels.
-	pub fn iop_compiler(&self) -> &BaseFoldVerifierCompiler<B128, BinaryMerkleTreeScheme<B128, H>> {
+	pub const fn iop_compiler(
+		&self,
+	) -> &BaseFoldVerifierCompiler<B128, BinaryMerkleTreeScheme<B128, H>> {
 		&self.iop_compiler
 	}
 
@@ -392,9 +412,11 @@ where
 		)
 		.entered();
 
-		// Create channel and delegate to IOPVerifier::verify
+		// Create channel, delegate to IOPVerifier::verify, then finish it.
 		let mut channel = self.iop_compiler.create_channel(transcript);
-		self.iop_verifier.verify(public, &mut channel)
+		self.iop_verifier.verify(public, &mut channel)?;
+		channel.finish()?;
+		Ok(())
 	}
 }
 

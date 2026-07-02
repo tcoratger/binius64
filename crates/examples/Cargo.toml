@@ -32,7 +32,7 @@ peakmem-alloc = "0.3.0"
 rand = { workspace = true, features = ["thread_rng"] }
 sha2.workspace = true
 sha3.workspace = true
-tiny-keccak = "2.0.2"
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
 tracing-forest.workspace = true
 tracing-profile.workspace = true
 tracing-subscriber.workspace = true
@@ -64,6 +64,18 @@ name = "hashsign"
 harness = false
 
 [[bench]]
+name = "sha256_compressions"
+harness = false
+
+[[bench]]
+name = "blake3_compressions"
+harness = false
+
+[[bench]]
+name = "keccak_permutations"
+harness = false
+
+[[bench]]
 name = "sha256"
 harness = false
 
@@ -72,9 +84,9 @@ name = "sha512"
 harness = false
 
 [features]
-default = ["rayon"]
+default = []
 perfetto = ["tracing-profile/perfetto"]
-rayon = ["binius-hash/rayon", "binius-prover/rayon"]
+rayon = ["binius-utils/rayon"]
 
 # Tutorial examples
 [[example]]

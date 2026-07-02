@@ -43,6 +43,7 @@ use binius_iop::{
 	channel::{IOPVerifierChannel, OracleLinearRelation, OracleSpec},
 	fri::{self, MinProofSizeStrategy},
 	merkle_tree::BinaryMerkleTreeScheme,
+	oracle_setup_channel::{DummyElem, OracleSetupChannel},
 };
 use binius_ip::{channel::IPVerifierChannel, mlecheck, sumcheck};
 use binius_math::{multilinear::eq::eq_ind_partial_eval_scalars, univariate::evaluate_univariate};
@@ -51,10 +52,7 @@ use binius_transcript::{VerifierTranscript, fiat_shamir::Challenger};
 use binius_utils::{DeserializeBytes, checked_arithmetics::checked_log_2};
 use digest::Output;
 
-use crate::{
-	constraint_system::{BlindingInfo, ConstraintSystemPadded},
-	wiring::evaluate_wiring_mle_public,
-};
+use crate::constraint_system::{BlindingInfo, ConstraintSystemPadded};
 
 pub const SECURITY_BITS: usize = 96;
 
@@ -100,27 +98,43 @@ where
 
 impl<F: Field> IOPVerifier<F> {
 	/// Constructs an IOP verifier for a constraint system.
-	pub fn new(constraint_system: ConstraintSystemPadded<F>) -> Self {
+	pub const fn new(constraint_system: ConstraintSystemPadded<F>) -> Self {
 		Self { constraint_system }
 	}
 
-	pub fn constraint_system(&self) -> &ConstraintSystemPadded<F> {
+	pub const fn constraint_system(&self) -> &ConstraintSystemPadded<F> {
 		&self.constraint_system
 	}
 
 	/// Returns the oracle specs for the IOP channel.
 	///
 	/// These describe the oracles (witness and mask) that the prover commits to.
-	pub fn oracle_specs(&self) -> Vec<OracleSpec> {
+	///
+	/// The specs are derived by replaying the oracle-receiving sequence against an
+	/// [`OracleSetupChannel`] (which records each `recv_oracle` without doing real verification),
+	/// rather than hardcoding it. IronSpartan proofs are always zero-knowledge. The precommit
+	/// oracle is received by the outer [`Verifier::verify`] before it delegates to
+	/// [`Self::verify`], so it is recorded here first to match that order.
+	pub fn oracle_specs(&self) -> Vec<OracleSpec>
+	where
+		F: BinaryField,
+	{
 		let cs = &self.constraint_system;
-		let (m_n, m_d) = cs.mask_dims();
-		let log_mask_dim = m_n + m_d;
-
-		vec![
-			OracleSpec::new_zk(cs.log_precommit() as usize),
-			OracleSpec::new_zk(cs.log_private() as usize),
-			OracleSpec::new_zk(log_mask_dim),
-		]
+		let mut channel = OracleSetupChannel::new(true);
+		// Record the precommit oracle first (`OracleSetupChannel` implements the channel trait for
+		// every `F`, so the trait is named explicitly to fix `F`); the `verify` call below fixes it
+		// for the rest of the sequence.
+		<OracleSetupChannel as IOPVerifierChannel<'_, F>>::recv_oracle(
+			&mut channel,
+			cs.log_precommit() as usize,
+			true,
+		)
+		.expect("OracleSetupChannel::recv_oracle is infallible");
+		let public = vec![DummyElem; 1 << cs.log_public()];
+		// Discarded: the setup channel performs no real verification; we only read back the
+		// recorded oracle specs.
+		let _ = self.verify((), public, &mut channel);
+		channel.into_oracle_specs()
 	}
 
 	/// Verifies a proof using an IOP channel.
@@ -159,9 +173,13 @@ impl<F: Field> IOPVerifier<F> {
 			});
 		}
 
-		// Receive the private and mask oracle commitments.
-		let private_oracle = channel.recv_oracle()?;
-		let mask_oracle = channel.recv_oracle()?;
+		// Receive the private and mask oracle commitments. The private witness is
+		// witness-dependent. The mask is passed `is_witness_dependent = true` to preserve its ZK
+		// masking (it is a fresh random mask rather than witness data, but is committed with
+		// hiding in the ZK protocol).
+		let private_oracle = channel.recv_oracle(cs.log_private() as usize, true)?;
+		let (m_n, m_d) = cs.mask_dims();
+		let mask_oracle = channel.recv_oracle(m_n + m_d, true)?;
 
 		// Verify the multiplication constraints.
 		let MulcheckOutput {
@@ -189,7 +207,6 @@ impl<F: Field> IOPVerifier<F> {
 		// field values, run the MLE evaluation in plaintext, and materialize the result as a
 		// single inout wire instead of building the entire sub-circuit.
 		let public_eval = {
-			let public_len = public.len();
 			let inputs = [
 				public.as_slice(),
 				slice::from_ref(&lambda),
@@ -197,18 +214,8 @@ impl<F: Field> IOPVerifier<F> {
 			]
 			.concat();
 
-			let mul_constraints = cs.mul_constraints();
-			channel.compute_public_value(&inputs, move |vals| {
-				let public_vals = &vals[..public_len];
-				let lambda_val = vals[public_len];
-				let r_x_tensor_vals = &vals[public_len + 1..];
-				evaluate_wiring_mle_public(
-					mul_constraints,
-					public_vals,
-					lambda_val,
-					r_x_tensor_vals,
-				)
-			})
+			let eval_fn = wiring::PublicWiringEvalFn::new(cs.mul_constraints(), public.len());
+			channel.compute_public_value(&inputs, eval_fn)
 		};
 
 		// Prover sends the precommit segment's contribution to the operand evaluations.
@@ -224,7 +231,7 @@ impl<F: Field> IOPVerifier<F> {
 			lambda.clone(),
 		);
 		let private_transparent =
-			wiring::eval_transparent(cs, WitnessSegment::Private, r_x_tensor.clone(), lambda);
+			wiring::eval_transparent(cs, WitnessSegment::Private, r_x_tensor, lambda);
 		let mask_transparent = mask_transparent(cs, &r_x);
 
 		// Verify all oracle relations
@@ -293,16 +300,16 @@ where
 	}
 
 	/// Returns a reference to the IOP verifier.
-	pub fn iop_verifier(&self) -> &IOPVerifier<F> {
+	pub const fn iop_verifier(&self) -> &IOPVerifier<F> {
 		&self.iop_verifier
 	}
 
-	pub fn constraint_system(&self) -> &ConstraintSystemPadded<F> {
+	pub const fn constraint_system(&self) -> &ConstraintSystemPadded<F> {
 		self.iop_verifier.constraint_system()
 	}
 
 	/// Returns a reference to the BaseFold ZK verifier compiler.
-	pub fn iop_compiler(&self) -> &BaseFoldVerifierCompiler<F, BinaryMerkleTreeScheme<F, H>> {
+	pub const fn iop_compiler(&self) -> &BaseFoldVerifierCompiler<F, BinaryMerkleTreeScheme<F, H>> {
 		&self.basefold_compiler
 	}
 
@@ -327,7 +334,8 @@ where
 		// Create channel, receive the precommit oracle, and delegate to IOPVerifier::verify. The
 		// IOP verifier only queues the oracle relations; `finish` runs the single combined opening.
 		let mut channel = self.basefold_compiler.create_channel(transcript);
-		let precommit_oracle = channel.recv_oracle()?;
+		let precommit_oracle =
+			channel.recv_oracle(self.constraint_system().log_precommit() as usize, true)?;
 		self.iop_verifier
 			.verify(precommit_oracle, public.to_vec(), &mut channel)?;
 		Ok(channel.finish()?)

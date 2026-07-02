@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
@@ -37,7 +35,7 @@ jobs:
       - name: Check typos
         run: prek run typos --all-files
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
           components: rustfmt
       - name: Install nightly toolchain for rustfmt
@@ -77,26 +75,10 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v6
-      # GitHub-hosted x86_64 runners include both Intel (with AVX-512/GFNI) and
-      # AMD (without) SKUs. With `-Ctarget-cpu=native`, build artifacts cached
-      # on one SKU produce illegal instructions when restored on another.
-      # Hash the CPU feature set into the cache key so heterogeneous runners do
-      # not share artifacts. Skipped for portable builds (CPU-agnostic output).
-      - name: Compute CPU feature cache key
-        if: matrix.arch.rustflags != ''
-        id: cpu
-        run: |
-          if [ -r /proc/cpuinfo ]; then
-            HASH=$(grep -m1 -E '^(flags|Features)[[:space:]]*:' /proc/cpuinfo | sha256sum | cut -c1-16)
-          else
-            HASH=portable
-          fi
-          echo "key=cpu-${HASH}" >> "$GITHUB_OUTPUT"
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
           components: clippy
-          cache-key: ${{ steps.cpu.outputs.key }}
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -127,7 +109,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v6
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
           target: wasm32-unknown-unknown
       - name: Compile vanilla wasm32
@@ -140,7 +122,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v6
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
           target: wasm32-wasip1
       - name: Set up Wasmer
@@ -157,7 +139,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v6
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
       - name: Build documentation (including private items for CI checks)
         run: cargo doc --document-private-items --no-deps
         env:
@@ -172,7 +154,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v6
       - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
       # One job instead of a 9-way matrix: the examples share the same `binius-examples` crate, so
       # a matrix recompiled that whole tree (which links the prover + verifier) nine times for a
       # stats-only check. Building once and running each snapshot in turn keeps the work but cuts
@@ -185,44 +167,3 @@ jobs:
             cargo run --example "${example}" -- check-snapshot
             echo "::endgroup::"
           done
-
-  # This job ensures all CI checks pass
-  ci-all-checks:
-    runs-on: ubuntu-latest
-    # Run if: dependencies succeeded OR it's a Graphite MQ PR (even with skipped deps)
-    # This ensures Graphite MQ can't merge with skipped tests
-    if: success() || startsWith(github.head_ref, 'gtmq_')
-    needs:
-      - format
-      - rust-checks
-      - wasm-vanilla-build
-      - wasm-tests
-      - rust-doc
-      - circuits-snapshot
-    steps:
-      - name: Verify all jobs succeeded
-        run: |
-          set -e  # Exit immediately if any command fails
-
-          echo "Job results:"
-          echo "format: ${{ needs.format.result }}"
-          echo "rust-checks: ${{ needs.rust-checks.result }}"
-          echo "wasm-vanilla-build: ${{ needs.wasm-vanilla-build.result }}"
-          echo "wasm-tests: ${{ needs.wasm-tests.result }}"
-          echo "wasm-tests: ${{ needs.wasm-tests.result }}"
-          echo "rust-doc: ${{ needs.rust-doc.result }}"
-          echo "circuits-snapshot: ${{ needs.circuits-snapshot.result }}"
-          echo ""
-
-          echo "Job results (JSON):"
-          echo '${{ toJson(needs) }}' | jq .
-          echo ""
-
-          echo "Verifying all jobs actually ran and succeeded..."
-
-          # note:
-          # - 'all(...)' returns true only if the condition is true for ALL items
-          # - '--exit-status' makes jq exit with code 1 if the check fails (causing job to fail)
-          jq --exit-status 'all(.result == "success")' <<< '${{ toJson(needs) }}'
-
-          echo "✅ All CI checks passed successfully"

@@ -7,7 +7,7 @@
 //! mask; non-ZK oracles are committed without a mask. All committed oracles are opened with a
 //! single combined FRI.
 
-use binius_field::BinaryField;
+use binius_field::{BinaryField, util::FieldFn};
 use binius_ip::{
 	channel::IPVerifierChannel,
 	sumcheck::{self, BatchSumcheckOutput},
@@ -75,7 +75,7 @@ where
 	///
 	/// The FRI parameters should already account for ZK (log_batch_size = 1, doubled message
 	/// length).
-	pub fn from_precomputed(
+	pub const fn from_precomputed(
 		transcript: &'a mut VerifierTranscript<Challenger_>,
 		merkle_scheme: &'a MerkleScheme_,
 		oracle_specs: &'a [OracleSpec],
@@ -93,7 +93,7 @@ where
 	}
 
 	/// Returns a reference to the underlying transcript.
-	pub fn transcript(&self) -> &VerifierTranscript<Challenger_> {
+	pub const fn transcript(&self) -> &VerifierTranscript<Challenger_> {
 		self.transcript
 	}
 
@@ -326,8 +326,8 @@ where
 		}
 	}
 
-	fn compute_public_value(&mut self, inputs: &[F], f: impl FnOnce(&[F]) -> F) -> F {
-		f(inputs)
+	fn compute_public_value(&mut self, inputs: &[F], f: impl FieldFn<F>) -> F {
+		f.call::<F>(inputs)
 	}
 }
 
@@ -344,7 +344,13 @@ where
 		&self.oracle_specs[self.next_oracle_index..]
 	}
 
-	fn recv_oracle(&mut self) -> Result<Self::Oracle, Error> {
+	fn recv_oracle(
+		&mut self,
+		_log_msg_len: usize,
+		_is_witness_dependent: bool,
+	) -> Result<Self::Oracle, Error> {
+		// A BaseFold commitment is a fixed-size Merkle digest, so `log_msg_len` is not needed here;
+		// the per-oracle specs (used for the FRI opening) are supplied at channel construction.
 		assert!(
 			!self.remaining_oracle_specs().is_empty(),
 			"recv_oracle called but no remaining oracle specs"

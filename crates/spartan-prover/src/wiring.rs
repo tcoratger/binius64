@@ -66,11 +66,11 @@ impl WiringTranspose {
 		}
 	}
 
-	pub fn log_size(&self) -> usize {
+	pub const fn log_size(&self) -> usize {
 		self.log_size
 	}
 
-	pub fn size(&self) -> usize {
+	pub const fn size(&self) -> usize {
 		1 << self.log_size
 	}
 
@@ -172,13 +172,13 @@ pub fn build_mulcheck_witness<F: Field, P: PackedField<Scalar = F>>(
 	precommit_packed: FieldSlice<P>,
 	private_packed: FieldSlice<P>,
 ) -> MulCheckWitness<P> {
-	fn get_a(c: &MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex> {
+	const fn get_a(c: &MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex> {
 		&c.a
 	}
-	fn get_b(c: &MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex> {
+	const fn get_b(c: &MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex> {
 		&c.b
 	}
-	fn get_c(c: &MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex> {
+	const fn get_c(c: &MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex> {
 		&c.c
 	}
 
@@ -498,7 +498,7 @@ mod tests {
 
 		// Receive witness oracle
 		let witness_oracle = verifier_channel
-			.recv_oracle()
+			.recv_oracle(log_private, true)
 			.expect("recv_oracle should succeed");
 
 		// Sample the same lambda as prover

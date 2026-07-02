@@ -2,18 +2,17 @@
 
 use binius_core::{
 	constraint_system::{AndConstraint, ConstraintSystem, MulConstraint, ValueVec},
-	verify::eval_operand,
 	word::Word,
 };
 use binius_field::{
-	AESTowerField8b as B8, BinaryField, ExtensionField, PackedAESBinaryField64x8b, PackedExtension,
-	PackedField,
+	AESTowerField8b as B8, BinaryField, ExtensionField, PackedExtension, PackedField,
 };
 use binius_hash::binary_merkle_tree::HashSuite;
 use binius_iop_prover::{
 	basefold_channel::BaseFoldProverChannel, basefold_compiler::BaseFoldProverCompiler,
 	channel::IOPProverChannel,
 };
+use binius_ip::sumcheck::SumcheckOutput;
 use binius_math::{
 	BinarySubspace, FieldBuffer, FieldSlice,
 	inner_product::inner_product,
@@ -28,7 +27,7 @@ use binius_verifier::{
 	config::{
 		B1, B128, LOG_WORD_SIZE_BITS, LOG_WORDS_PER_ELEM, PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES,
 	},
-	protocols::{bitand::AndCheckOutput, intmul::IntMulOutput, sumcheck::SumcheckOutput},
+	protocols::{bitand::AndCheckOutput, intmul::IntMulOutput},
 };
 use digest::Output;
 use rand::{SeedableRng, rngs::StdRng};
@@ -80,14 +79,14 @@ impl IOPProver {
 	}
 
 	/// Returns the constraint system.
-	pub fn constraint_system(&self) -> &ConstraintSystem {
+	pub const fn constraint_system(&self) -> &ConstraintSystem {
 		&self.constraint_system
 	}
 
 	/// Returns a reference to the KeyCollection.
 	///
 	/// This can be used to serialize the KeyCollection for later use.
-	pub fn key_collection(&self) -> &KeyCollection {
+	pub const fn key_collection(&self) -> &KeyCollection {
 		&self.key_collection
 	}
 
@@ -95,7 +94,7 @@ impl IOPProver {
 	///
 	/// This is the core proving logic, independent of the specific IOP compilation strategy.
 	/// For most users, [`Prover::prove`] is the simpler interface.
-	pub fn prove<P, Channel>(&self, witness: ValueVec, mut channel: Channel) -> Result<(), Error>
+	pub fn prove<P, Channel>(&self, witness: ValueVec, channel: &mut Channel) -> Result<(), Error>
 	where
 		P: PackedField<Scalar = B128> + PackedExtension<B128> + PackedExtension<B1>,
 		Channel: IOPProverChannel<P>,
@@ -132,7 +131,7 @@ impl IOPProver {
 		)
 		.entered();
 		let mul_witness = build_intmul_witness(&cs.mul_constraints, &witness);
-		let intmul_output = prove_intmul_reduction::<_, P, _>(mul_witness, &mut channel)?;
+		let intmul_output = prove_intmul_reduction::<_, P, _>(mul_witness, &mut *channel)?;
 		drop(intmul_guard);
 
 		// [phase] BitAnd Reduction - AND constraint reduction
@@ -151,7 +150,7 @@ impl IOPProver {
 				c_eval,
 				z_challenge,
 				eval_point,
-			} = prove_bitand_reduction::<B128, P, _>(bitand_witness, &mut channel)?;
+			} = prove_bitand_reduction::<B128, P, _>(bitand_witness, &mut *channel)?;
 			OperatorData {
 				evals: vec![a_eval, b_eval, c_eval],
 				r_zhat_prime: z_challenge,
@@ -203,7 +202,7 @@ impl IOPProver {
 			witness.combined_witness(),
 			bitand_claim,
 			intmul_claim,
-			&mut channel,
+			&mut *channel,
 		)?;
 		drop(shift_guard);
 
@@ -219,7 +218,7 @@ impl IOPProver {
 		let ring_switch::RingSwitchOutput {
 			rs_eq_ind,
 			sumcheck_claim,
-		} = ring_switch::prove(&witness_packed, &eval_point, &mut channel);
+		} = ring_switch::prove(&witness_packed, &eval_point, &mut *channel);
 
 		// Public input check batched with ring-switch
 		let log_packing = <B128 as ExtensionField<B1>>::LOG_DEGREE;
@@ -315,14 +314,14 @@ where
 	}
 
 	/// Returns a reference to the IOP prover.
-	pub fn iop_prover(&self) -> &IOPProver {
+	pub const fn iop_prover(&self) -> &IOPProver {
 		&self.iop_prover
 	}
 
 	/// Returns a reference to the KeyCollection.
 	///
 	/// This can be used to serialize the KeyCollection for later use.
-	pub fn key_collection(&self) -> &KeyCollection {
+	pub const fn key_collection(&self) -> &KeyCollection {
 		self.iop_prover.key_collection()
 	}
 
@@ -341,13 +340,15 @@ where
 		)
 		.entered();
 
-		// Create channel and delegate to IOPProver::prove. The unified channel takes an rng to
-		// mask ZK oracles, but a plain `Prover` produces a transparent proof whose only oracle is
-		// non-ZK, so no masks are drawn and the rng is never consumed.
+		// Create channel, delegate to IOPProver::prove, then finish it. The unified channel takes
+		// an rng to mask ZK oracles, but a plain `Prover` produces a transparent proof whose only
+		// oracle is non-ZK, so no masks are drawn and the rng is never consumed.
 		let rng = StdRng::seed_from_u64(0);
-		let channel =
+		let mut channel =
 			BaseFoldProverChannel::from_compiler(&self.basefold_compiler, transcript, rng);
-		self.iop_prover.prove::<P, _>(witness, channel)
+		self.iop_prover.prove::<P, _>(witness, &mut channel)?;
+		channel.finish();
+		Ok(())
 	}
 }
 
@@ -407,8 +408,10 @@ pub fn pack_witness<P: PackedField<Scalar = B128>>(
 
 	// Pack word pairs into B128 elements (2 words per field element), then group into P.
 	// Zero-pad up to the power-of-two witness polynomial length after the real words.
-	let (pairs, remainder) = witness.as_chunks::<2>();
-	pairs
+	let (pairs, word_remaining) = witness.as_chunks::<2>();
+	let aligned_len = pairs.len() / P::WIDTH * P::WIDTH;
+	let (pairs_aligned, word_pair_remaining) = pairs.split_at(aligned_len);
+	pairs_aligned
 		.par_chunks(P::WIDTH)
 		.map(|word_pairs| {
 			P::from_scalars(
@@ -419,8 +422,18 @@ pub fn pack_witness<P: PackedField<Scalar = B128>>(
 		})
 		.collect_into_vec(&mut padded_witness_elems);
 
-	if let [last_word] = remainder {
-		padded_witness_elems.push(P::from_scalars(std::iter::once(B128::new(last_word.0 as u128))));
+	// The trailing partial group: any leftover word pairs (fewer than `P::WIDTH` of them) together
+	// with a final unpaired word are packed into a single `P` element. This keeps the zero padding
+	// strictly after the last real word, rather than splitting the unpaired word into a separate
+	// element and leaving a zero in the middle of the witness (BINIUS-173).
+	if !word_pair_remaining.is_empty() || !word_remaining.is_empty() {
+		let word_pairs = word_pair_remaining
+			.iter()
+			.copied()
+			.chain(word_remaining.iter().map(|&word| [word, Word::ZERO]));
+		padded_witness_elems.push(P::from_scalars(
+			word_pairs.map(|[w0, w1]| B128::new(((w1.0 as u128) << 64) | (w0.0 as u128))),
+		));
 	}
 
 	padded_witness_elems.resize(len, P::default());
@@ -446,7 +459,7 @@ where
 		log_constraint_count.saturating_sub(PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES.len());
 	let big_field_zerocheck_challenges = channel.sample_many(n_extra_zerocheck_challenges);
 
-	let prover = OblongZerocheckProver::<_, PackedAESBinaryField64x8b, PChallenge>::new(
+	let prover = OblongZerocheckProver::<_, PChallenge>::new(
 		log_constraint_count,
 		a,
 		b,
@@ -506,9 +519,9 @@ fn build_bitand_witness(and_constraints: &[AndConstraint], witness: &ValueVec) -
 	(and_constraints, a.spare_capacity_mut(), b.spare_capacity_mut(), c.spare_capacity_mut())
 		.into_par_iter()
 		.for_each(|(constraint, a_i, b_i, c_i)| {
-			a_i.write(eval_operand(witness, &constraint.a));
-			b_i.write(eval_operand(witness, &constraint.b));
-			c_i.write(eval_operand(witness, &constraint.c));
+			a_i.write(witness.eval_operand(&constraint.a));
+			b_i.write(witness.eval_operand(&constraint.b));
+			c_i.write(witness.eval_operand(&constraint.c));
 		});
 
 	// Safety: all entries in a, b, c are initialized in the parallel loop above.
@@ -539,10 +552,10 @@ fn build_intmul_witness(mul_constraints: &[MulConstraint], witness: &ValueVec) -
 	)
 		.into_par_iter()
 		.for_each(|(constraint, a_i, b_i, lo_i, hi_i)| {
-			a_i.write(eval_operand(witness, &constraint.a));
-			b_i.write(eval_operand(witness, &constraint.b));
-			lo_i.write(eval_operand(witness, &constraint.lo));
-			hi_i.write(eval_operand(witness, &constraint.hi));
+			a_i.write(witness.eval_operand(&constraint.a));
+			b_i.write(witness.eval_operand(&constraint.b));
+			lo_i.write(witness.eval_operand(&constraint.lo));
+			hi_i.write(witness.eval_operand(&constraint.hi));
 		});
 
 	// Safety: all entries in a, b, lo, hi are initialized in the parallel loop above.
@@ -554,4 +567,65 @@ fn build_intmul_witness(mul_constraints: &[MulConstraint], witness: &ValueVec) -
 	}
 
 	MulCheckWitness { a, b, lo, hi }
+}
+
+#[cfg(test)]
+mod tests {
+	use binius_field::{Field, PackedBinaryGhash2x128b};
+
+	use super::{B128, Word, pack_witness};
+
+	/// The packing `pack_witness` is specified to produce: consecutive little-endian B128 elements
+	/// (low word in bits 0..64, high word in bits 64..128), a final unpaired word in the low half,
+	/// then zero padding up to `n_elems`.
+	fn expected_scalars(words: &[Word], n_elems: usize) -> Vec<B128> {
+		let mut scalars = vec![B128::ZERO; n_elems];
+		for (elem, pair) in scalars.iter_mut().zip(words.chunks(2)) {
+			let lo = pair[0].0 as u128;
+			let hi = pair.get(1).map_or(0, |w| w.0 as u128);
+			*elem = B128::new((hi << 64) | lo);
+		}
+		scalars
+	}
+
+	/// Regression test for BINIUS-173: with `P::WIDTH = 2`, a witness of 7 words has 3 word-pairs
+	/// (not a multiple of the packing width) plus a trailing unpaired word. The buggy code
+	/// zero-padded the final partial `P` chunk and then pushed the unpaired word as a *separate*
+	/// element, shifting the last real scalar by one position.
+	#[test]
+	fn test_pack_witness_unaligned_pair_count_with_remainder() {
+		type P = PackedBinaryGhash2x128b;
+		assert_eq!(P::WIDTH, 2, "this test is meaningful only when the packing width is 2");
+
+		let words: Vec<Word> = (1..=7u64).map(Word).collect();
+		let log_witness_elems = 3; // 8 field elements: 4 real, 4 zero-padding.
+
+		let packed = pack_witness::<P>(log_witness_elems, &words).unwrap();
+		let got: Vec<B128> = packed.iter_scalars().collect();
+
+		assert_eq!(got, expected_scalars(&words, 1 << log_witness_elems));
+	}
+
+	/// Covers every residue of the word count around the `2 * P::WIDTH` boundary (aligned and
+	/// unaligned, with and without a trailing word) plus a few larger sizes.
+	#[test]
+	fn test_pack_witness_various_lengths() {
+		type P = PackedBinaryGhash2x128b;
+
+		for n_words in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 13, 17] {
+			let words: Vec<Word> = (0..n_words as u64).map(|i| Word(i + 100)).collect();
+			let n_elems = n_words.div_ceil(2);
+			// Round up to a power of two, and to at least one full packed element.
+			let log_witness_elems = n_elems.max(P::WIDTH).next_power_of_two().ilog2() as usize;
+
+			let packed = pack_witness::<P>(log_witness_elems, &words).unwrap();
+			let got: Vec<B128> = packed.iter_scalars().collect();
+
+			assert_eq!(
+				got,
+				expected_scalars(&words, 1 << log_witness_elems),
+				"n_words = {n_words}"
+			);
+		}
+	}
 }

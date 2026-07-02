@@ -85,6 +85,38 @@ pub enum ShiftVariant {
 	Rotr32,
 }
 
+impl ShiftVariant {
+	/// Applies this shift to a 64-bit word and returns the result.
+	///
+	/// The variant selects which word-level operation runs.
+	/// Full-width variants act on the whole 64-bit word.
+	/// The 32-bit variants act on the upper and lower halves independently.
+	///
+	/// # Arguments
+	/// - The word to shift.
+	/// - The shift amount in bits.
+	#[inline]
+	pub fn apply(self, word: Word, amount: usize) -> Word {
+		// The word-level operators take the amount as a 32-bit count.
+		let amount = amount as u32;
+		// Dispatch to the matching operation:
+		// - logical left / logical right shift in zeros.
+		// - arithmetic right replicates the sign bit.
+		// - rotate wraps bits around the word.
+		// - the `*32` family applies the same op to each 32-bit half on its own.
+		match self {
+			ShiftVariant::Sll => word << amount,
+			ShiftVariant::Slr => word >> amount,
+			ShiftVariant::Sar => word.sar(amount),
+			ShiftVariant::Rotr => word.rotr(amount),
+			ShiftVariant::Sll32 => word.sll32(amount),
+			ShiftVariant::Srl32 => word.srl32(amount),
+			ShiftVariant::Sra32 => word.sra32(amount),
+			ShiftVariant::Rotr32 => word.rotr32(amount),
+		}
+	}
+}
+
 impl SerializeBytes for ShiftVariant {
 	fn serialize(&self, write_buf: impl BufMut) -> Result<(), SerializationError> {
 		let index = match self {
@@ -145,7 +177,7 @@ pub struct ShiftedValueIndex {
 impl ShiftedValueIndex {
 	/// Create a value index that just uses the specified value. Equivalent to [`Self::sll`] with
 	/// amount equals 0.
-	pub fn plain(value_index: ValueIndex) -> Self {
+	pub const fn plain(value_index: ValueIndex) -> Self {
 		Self {
 			value_index,
 			shift_variant: ShiftVariant::Sll,
@@ -274,6 +306,17 @@ impl ShiftedValueIndex {
 			shift_variant: ShiftVariant::Rotr32,
 			amount,
 		}
+	}
+
+	/// Evaluates this term against a witness.
+	///
+	/// A term names one value and a shift to apply to it.
+	/// It contributes one shifted word to the XOR that forms an operand.
+	#[inline]
+	pub fn eval(&self, witness: &ValueVec) -> Word {
+		// Look up the referenced word, then apply this term's shift.
+		self.shift_variant
+			.apply(witness[self.value_index], self.amount)
 	}
 }
 
@@ -583,17 +626,17 @@ impl ConstraintSystem {
 	}
 
 	/// Returns the number of AND constraints in the system.
-	pub fn n_and_constraints(&self) -> usize {
+	pub const fn n_and_constraints(&self) -> usize {
 		self.and_constraints.len()
 	}
 
 	/// Returns the number of MUL  constraints in the system.
-	pub fn n_mul_constraints(&self) -> usize {
+	pub const fn n_mul_constraints(&self) -> usize {
 		self.mul_constraints.len()
 	}
 
 	/// The total length of the [`ValueVec`] expected by this constraint system.
-	pub fn value_vec_len(&self) -> usize {
+	pub const fn value_vec_len(&self) -> usize {
 		self.value_vec_layout.committed_total_len
 	}
 
@@ -681,7 +724,7 @@ impl ValueVecLayout {
 	///
 	/// - the public segment (constants and inout values) is padded to the power of two.
 	/// - the public segment is not less than the minimum size.
-	pub fn validate(&self) -> Result<(), ConstraintSystemError> {
+	pub const fn validate(&self) -> Result<(), ConstraintSystemError> {
 		if !self.offset_witness.is_power_of_two() {
 			return Err(ConstraintSystemError::PublicInputPowerOfTwo);
 		}
@@ -695,7 +738,7 @@ impl ValueVecLayout {
 	}
 
 	/// Returns true if the given index points to an area that is considered to be padding.
-	fn is_padding(&self, index: ValueIndex) -> bool {
+	const fn is_padding(&self, index: ValueIndex) -> bool {
 		let idx = index.0 as usize;
 
 		// padding 1: between constants and inout section
@@ -719,7 +762,7 @@ impl ValueVecLayout {
 	}
 
 	/// Returns true if the given index is out-of-bounds for the committed part of this layout.
-	fn is_committed_oob(&self, index: ValueIndex) -> bool {
+	const fn is_committed_oob(&self, index: ValueIndex) -> bool {
 		index.0 as usize >= self.committed_total_len
 	}
 }
@@ -886,7 +929,7 @@ impl ValueVec {
 	}
 
 	/// The total size of the committed portion of the vector (excluding scratch).
-	pub fn size(&self) -> usize {
+	pub const fn size(&self) -> usize {
 		self.layout.committed_total_len
 	}
 
@@ -927,6 +970,18 @@ impl ValueVec {
 		let end = self.layout.committed_total_len;
 		&self.data[start..end]
 	}
+
+	/// Evaluates an operand against this witness.
+	///
+	/// An operand is the XOR of its shifted-value terms.
+	/// An empty operand evaluates to the zero word, the XOR identity.
+	#[inline]
+	pub fn eval_operand(&self, operand: &[ShiftedValueIndex]) -> Word {
+		// Fold each shifted term into the running XOR, starting from the identity.
+		operand
+			.iter()
+			.fold(Word::ZERO, |acc, term| acc ^ term.eval(self))
+	}
 }
 
 impl Index<ValueIndex> for ValueVec {
@@ -958,14 +1013,14 @@ impl<'a> ValuesData<'a> {
 	pub const SERIALIZATION_VERSION: u32 = 1;
 
 	/// Create a new ValuesData from borrowed data
-	pub fn borrowed(data: &'a [Word]) -> Self {
+	pub const fn borrowed(data: &'a [Word]) -> Self {
 		Self {
 			data: Cow::Borrowed(data),
 		}
 	}
 
 	/// Create a new ValuesData from owned data
-	pub fn owned(data: Vec<Word>) -> Self {
+	pub const fn owned(data: Vec<Word>) -> Self {
 		Self {
 			data: Cow::Owned(data),
 		}
@@ -1084,7 +1139,7 @@ impl<'a> Proof<'a> {
 	pub const SERIALIZATION_VERSION: u32 = 1;
 
 	/// Create a new Proof from borrowed transcript data
-	pub fn borrowed(data: &'a [u8], challenger_type: String) -> Self {
+	pub const fn borrowed(data: &'a [u8], challenger_type: String) -> Self {
 		Self {
 			data: Cow::Borrowed(data),
 			challenger_type,
@@ -1092,7 +1147,7 @@ impl<'a> Proof<'a> {
 	}
 
 	/// Create a new Proof from owned transcript data
-	pub fn owned(data: Vec<u8>, challenger_type: String) -> Self {
+	pub const fn owned(data: Vec<u8>, challenger_type: String) -> Self {
 		Self {
 			data: Cow::Owned(data),
 			challenger_type,
@@ -1927,12 +1982,9 @@ mod serialization_tests {
 		let non_pub2 = ValuesData::deserialize(&mut buf_non_pub.as_slice()).unwrap();
 
 		// Reconstruct ValueVec from deserialized pieces
-		let reconstructed = ValueVec::new_from_data(
-			cs2.value_vec_layout.clone(),
-			pub2.into_owned(),
-			non_pub2.into_owned(),
-		)
-		.unwrap();
+		let reconstructed =
+			ValueVec::new_from_data(cs2.value_vec_layout, pub2.into_owned(), non_pub2.into_owned())
+				.unwrap();
 
 		// Ensure committed part matches exactly
 		assert_eq!(reconstructed.combined_witness(), values.combined_witness());
@@ -2521,7 +2573,7 @@ mod serialization_tests {
 			};
 
 			// The public input must fill its whole power-of-two section, so zero-pad it.
-			let mut public_padded = public.clone();
+			let mut public_padded = public;
 			public_padded.resize(offset_witness, Word::ZERO);
 
 			let vv = ValueVec::new_from_data(layout, public_padded.clone(), private.clone()).unwrap();

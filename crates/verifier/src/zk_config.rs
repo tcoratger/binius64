@@ -54,8 +54,6 @@ use crate::{
 pub struct ZKVerifier<H: HashSuite> {
 	inner_iop_verifier: IOPVerifier,
 	outer_iop_verifier: IronSpartanIOPVerifier<B128>,
-	/// Shared in an `Arc` so each `verify` hands it to a `'static` [`InstanceGenerator`] cheaply.
-	/// Sharing keeps `ZKVerifier` `Send + Sync` (unlike `Rc`) and avoids cloning the layout per call.
 	outer_layout: Arc<WitnessLayout<B128>>,
 	basefold_compiler: BaseFoldVerifierCompiler<B128, BinaryMerkleTreeScheme<B128, H>>,
 }

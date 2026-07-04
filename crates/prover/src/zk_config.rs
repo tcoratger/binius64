@@ -44,7 +44,8 @@ where
 	inner_iop_verifier: IOPVerifier,
 	outer_iop_prover: binius_spartan_prover::IOPProver<B128>,
 	/// Shared with the verifier via an `Arc`, not owned outright.
-	/// Setup skips deep-cloning the layout, and each `prove` shares it with a reference-count bump.
+	/// Setup skips deep-cloning the layout, and each `prove` shares it with a reference-count
+	/// bump.
 	outer_layout: Arc<WitnessLayout<B128>>,
 	basefold_compiler: BaseFoldProverCompiler<P, ProverNTT<B128>, ProverMerkleProver<B128, H>>,
 }

@@ -445,7 +445,7 @@ pub fn verify<'r, F, C>(
 ) -> Result<IntMulOutput<C::Elem>, Error>
 where
 	F: BinaryField,
-	C: IOPVerifierChannel<'r, F>,
+	C: IOPVerifierChannel<F>,
 	C::Elem: FieldOps<Scalar = F> + From<F>,
 {
 	assert!(log_bits >= 1);

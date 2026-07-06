@@ -4,8 +4,10 @@
 
 mod bitand;
 mod commit;
+mod shift;
 mod verify;
 
 pub use bitand::verify_bitand_reduction;
 pub use commit::BatchCommitLayout;
+pub use shift::ShiftReductionOutput;
 pub use verify::Verifier;

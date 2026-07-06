@@ -8,8 +8,10 @@ mod monster;
 mod shift_ind;
 
 pub use monster::*;
+mod batch;
 mod error;
 mod verify;
 
+pub use batch::{BatchVerifyOutput, verify_batch};
 pub use error::Error;
 pub use verify::{OperatorData, VerifyOutput, check_eval, verify};

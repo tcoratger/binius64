@@ -2,11 +2,13 @@
 
 use binius_verifier::protocols::shift::{BITAND_ARITY, INTMUL_ARITY, SHIFT_VARIANT_COUNT};
 
+mod batch;
 mod key_collection;
 mod monster;
 mod phase_1;
 mod phase_2;
 mod prove;
 
+pub use batch::prove_batch;
 pub use key_collection::{KeyCollection, build_key_collection};
 pub use prove::{OperatorData, PreparedOperatorData, prove};

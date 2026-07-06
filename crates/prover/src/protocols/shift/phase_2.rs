@@ -90,7 +90,7 @@ where
 /// # Returns
 /// Returns `SumcheckOutput` with concatenated challenges `[r_j, r_y]` and witness evaluation.
 #[instrument(skip_all, name = "run_sumcheck")]
-fn run_sumcheck<F: Field, P: PackedField<Scalar = F>, Channel: IPProverChannel<F>>(
+pub(crate) fn run_sumcheck<F: Field, P: PackedField<Scalar = F>, Channel: IPProverChannel<F>>(
 	r_j_witness: FieldBuffer<P>,
 	monster_multilinear: FieldBuffer<P>,
 	r_j: Vec<F>,

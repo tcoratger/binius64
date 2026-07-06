@@ -4,8 +4,10 @@
 
 mod bitand;
 mod prove;
+mod shift;
 mod value_table;
 
 pub use bitand::BatchAndCheckWitness;
 pub use prove::Prover;
+pub use shift::ShiftReductionOutput;
 pub use value_table::{PopulateInstanceError, ValueTable};

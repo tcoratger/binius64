@@ -115,16 +115,13 @@ where
 	// n, the number of looker variables, from the 2^n rows.
 	let log_len = index.len().ilog2() as usize;
 
-	// One denominator per row: shift the challenge by the row's embedded index value.
-	// Pack P::WIDTH consecutive denominators into each word as they are computed.
-	// So the packed buffer is built in one pass, with no scalar buffer materialized first.
-	let packed_len = 1 << log_len.saturating_sub(P::LOG_WIDTH);
-	let mut packed = Vec::with_capacity(packed_len);
-	packed.extend(
-		index
-			.chunks(P::WIDTH)
-			.map(|chunk| P::from_scalars(chunk.iter().map(|&i| c - embed_position::<F>(i)))),
-	);
+	// One denominator per row: c minus the row's embedded index value.
+	// Subtract a full word at a time: one packed subtraction per word, built in parallel.
+	let c_packed = P::broadcast(c);
+	let packed = index
+		.par_chunks(P::WIDTH)
+		.map(|chunk| c_packed - P::from_scalars(chunk.iter().copied().map(embed_position::<F>)))
+		.collect::<Vec<_>>();
 
 	FieldBuffer::new(log_len, packed.into_boxed_slice())
 }

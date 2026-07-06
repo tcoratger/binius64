@@ -10,7 +10,7 @@ use binius_core::{
 	},
 	consts::LOG_WORD_SIZE_BITS,
 };
-use binius_field::Field;
+use binius_field::{Field, WideMul};
 use binius_utils::{
 	checked_arithmetics::log2_ceil_usize,
 	serialization::{DeserializeBytes, SerializationError, SerializeBytes},
@@ -124,51 +124,57 @@ impl Key {
 		})
 	}
 
-	/// Accumulates the same weighted sum as [`Self::accumulate_by_operand`], but fuses the
-	/// `lambda_powers[operand_index]` weighting into the consecutive-operand scan.
+	/// Accumulates the partial evaluation of an operation matrix for the key, in unreduced (wide)
+	/// form.
+	///
+	/// A [`Key`] references the operation constraints where one witness word is an operand. This
+	/// accumulates the partial evaluation of the operation matrix for this key, weighting each
+	/// operand's contribution by `scalars[operand_index]` and fusing that weighting into the
+	/// consecutive-operand scan. The caller reduces the result via [`WideMul::reduce`], and may
+	/// sum several wide accumulations before that single reduction.
 	#[inline]
-	fn accumulate_weighted<F: Field>(
+	pub fn accumulate_wide<F: Field>(
 		&self,
 		constraint_indices: &[ConstraintIndex],
-		operator_data: &PreparedOperatorData<F>,
-	) -> F {
+		r_x_prime_tensor: &[F],
+		scalars: &[F],
+	) -> <F as WideMul>::Output {
 		let Range { start, end } = self.range;
 		let mut constraint_indices = constraint_indices[start as usize..end as usize].iter();
 
+		let mut result = <F as WideMul>::Output::default();
 		let Some(first) = constraint_indices.next() else {
-			return F::ZERO;
+			return result;
 		};
 
 		let mut operand_index = first.operand_index as usize;
 		let mut acc = F::ZERO;
-		let mut result = F::ZERO;
-		let tensor = operator_data.r_x_prime_tensor.as_ref();
-		acc += tensor[first.constraint_index as usize];
+		acc += r_x_prime_tensor[first.constraint_index as usize];
 
 		for current in constraint_indices {
 			let current_operand_index = current.operand_index as usize;
 			if current_operand_index != operand_index {
-				result += acc * operator_data.lambda_powers[operand_index];
+				result += F::wide_mul(acc, scalars[operand_index]);
 				operand_index = current_operand_index;
 				acc = F::ZERO;
 			}
-			acc += tensor[current.constraint_index as usize];
+			acc += r_x_prime_tensor[current.constraint_index as usize];
 		}
 
-		result + acc * operator_data.lambda_powers[operand_index]
+		result + F::wide_mul(acc, scalars[operand_index])
 	}
 
 	/// Accumulates the partial evaluation of an operation matrix for the key.
 	///
-	/// A [`Key`] references the operation constraints where one witness word is an operand. This
-	/// accumulates the partial evaluation of the operation matrix for this key.
+	/// This is [`Self::accumulate_wide`] followed by a single reduction.
 	#[inline]
 	pub fn accumulate<F: Field>(
 		&self,
 		constraint_indices: &[ConstraintIndex],
-		operator_data: &PreparedOperatorData<F>,
+		r_x_prime_tensor: &[F],
+		scalars: &[F],
 	) -> F {
-		self.accumulate_weighted(constraint_indices, operator_data)
+		F::reduce(self.accumulate_wide(constraint_indices, r_x_prime_tensor, scalars))
 	}
 }
 
@@ -548,7 +554,7 @@ mod tests {
 	}
 
 	#[test]
-	fn accumulate_weighted_matches_grouped_operand_accumulation() {
+	fn accumulate_matches_grouped_operand_accumulation() {
 		let constraint_indices = vec![
 			ConstraintIndex {
 				operand_index: 0,
@@ -597,7 +603,14 @@ mod tests {
 			.map(|(operand_index, acc)| acc * operator_data.lambda_powers[operand_index])
 			.sum::<F>();
 
-		assert_eq!(key.accumulate_weighted(&constraint_indices, &operator_data), expected);
+		assert_eq!(
+			key.accumulate(
+				&constraint_indices,
+				operator_data.r_x_prime_tensor.as_ref(),
+				&operator_data.lambda_powers
+			),
+			expected
+		);
 
 		let non_contiguous_constraint_indices = vec![
 			ConstraintIndex {
@@ -632,8 +645,11 @@ mod tests {
 			.sum::<F>();
 
 		assert_eq!(
-			non_contiguous_key
-				.accumulate_weighted(&non_contiguous_constraint_indices, &operator_data),
+			non_contiguous_key.accumulate(
+				&non_contiguous_constraint_indices,
+				operator_data.r_x_prime_tensor.as_ref(),
+				&operator_data.lambda_powers
+			),
 			non_contiguous_expected
 		);
 
@@ -642,6 +658,13 @@ mod tests {
 			id: 0,
 			range: 0..0,
 		};
-		assert_eq!(empty_key.accumulate_weighted(&constraint_indices, &operator_data), F::ZERO);
+		assert_eq!(
+			empty_key.accumulate(
+				&constraint_indices,
+				operator_data.r_x_prime_tensor.as_ref(),
+				&operator_data.lambda_powers
+			),
+			F::ZERO
+		);
 	}
 }

@@ -5,8 +5,9 @@
 use digest::Output;
 
 use super::{
-	binary_merkle_tree::HashSuite, blake3_portable::PortableBlake3ParallelDigest,
-	compress::CompressionFunction, parallel_compression::ParallelCompressionAdaptor,
+	binary_merkle_tree::HashSuite,
+	blake3_portable::{PortableBlake3ParallelCompression, PortableBlake3ParallelDigest},
+	compress::CompressionFunction,
 };
 
 /// A two-to-one compression function that hashes the concatenation of its inputs with Blake3.
@@ -24,13 +25,12 @@ impl CompressionFunction<Output<blake3::Hasher>, 2> for Blake3Compression {
 
 /// Blake3 [`HashSuite`]: Blake3 leaves and a Blake3 compression function for inner nodes.
 ///
-/// Every leaf digest is a standard Blake3 hash; only the parallel compute path is specialized.
-/// - Leaves within one 1024-byte chunk are hashed by the portable auto-vectorized batch kernel.
+/// Both parallel compute paths use the portable auto-vectorized kernel, not the scalar loop:
+/// - Leaves within one 1024-byte chunk are hashed by the batch kernel.
 /// - Larger leaves fall back to the scalar adapter that walks the tree.
+/// - Every inner-node level folds its node pairs through the batched two-to-one compression.
 ///
-/// The speedup is confined to the sub-chunk regime the ZK leaf-hashing path exercises.
-///
-/// The batch width is fixed at 16 lanes:
+/// The batch width is fixed at 16 lanes for both paths:
 /// - The throughput sweet spot on NEON in the portable-kernel benchmark.
 /// - The width the AVX2 / AVX-512 vectorizer fills.
 /// - 4 and 8 lanes both measure slower.
@@ -41,7 +41,7 @@ impl HashSuite for Blake3HashSuite {
 	type LeafHash = blake3::Hasher;
 	type Compression = Blake3Compression;
 	type ParLeafHash = PortableBlake3ParallelDigest<16>;
-	type ParCompression = ParallelCompressionAdaptor<Blake3Compression>;
+	type ParCompression = PortableBlake3ParallelCompression<16>;
 }
 
 #[cfg(test)]

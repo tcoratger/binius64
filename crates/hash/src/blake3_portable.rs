@@ -1,6 +1,10 @@
 // Copyright 2026 The Binius Developers
 
-//! Experimental portable, auto-vectorized Blake3 multi-lane leaf hasher.
+//! Experimental portable, auto-vectorized Blake3 multi-lane kernel.
+//!
+//! Two batched entry points share one block-compression core:
+//! - Leaf hashing, for any message up to one 1024-byte chunk.
+//! - Two-to-one inner-node compression, `blake3(left || right)` over a 64-byte pair.
 //!
 //! An alternative to driving the `blake3` crate's hand-written SIMD kernel.
 //! The bet: LLVM auto-vectorizes plain lane loops into whatever the target has.
@@ -19,12 +23,22 @@
 
 use std::{array, mem::MaybeUninit};
 
-use binius_utils::{FixedSizeSerializeBytes, SerializeBytes, rayon::iter::IndexedParallelIterator};
+use binius_utils::{
+	FixedSizeSerializeBytes, SerializeBytes,
+	rayon::{
+		iter::{IndexedParallelIterator, ParallelIterator},
+		slice::{ParallelSlice, ParallelSliceMut},
+	},
+};
 use blake3::{BLOCK_LEN, CHUNK_LEN, OUT_LEN};
 use digest::Output;
 
-use super::parallel_digest::{
-	MultiDigest, ParallelDigest, ParallelDigestAdapter, ParallelMultidigestImpl,
+use super::{
+	blake3::Blake3Compression,
+	parallel_compression::ParallelPseudoCompression,
+	parallel_digest::{
+		MultiDigest, ParallelDigest, ParallelDigestAdapter, ParallelMultidigestImpl,
+	},
 };
 
 /// Blake3 domain-separation flag marking the first block of a chunk.
@@ -178,6 +192,16 @@ fn broadcast_iv<const N: usize>() -> [[u32; N]; 8] {
 	array::from_fn(|w| [IV[w]; N])
 }
 
+/// Serializes one lane's eight-word chaining value into its 32-byte little-endian digest.
+#[inline(always)]
+fn serialize_cv_lane<const N: usize>(cv: &[[u32; N]; 8], lane: usize) -> [u8; OUT_LEN] {
+	let mut digest = [0u8; OUT_LEN];
+	for (w, chunk) in digest.chunks_exact_mut(4).enumerate() {
+		chunk.copy_from_slice(&cv[w][lane].to_le_bytes());
+	}
+	digest
+}
+
 /// Portable multi-lane Blake3 leaf digest over `N` messages, hashed a block at a time.
 ///
 /// One chunk, so the chaining value stays at counter 0 and needs no CV stack.
@@ -245,11 +269,7 @@ impl<const N: usize> PortableBlake3MultiDigest<N> {
 
 		// Serialize each lane's eight-word chaining value into its 32-byte digest.
 		for lane in 0..N {
-			let mut digest = [0u8; OUT_LEN];
-			for (w, chunk) in digest.chunks_exact_mut(4).enumerate() {
-				chunk.copy_from_slice(&cv[w][lane].to_le_bytes());
-			}
-			out[lane].write(digest.into());
+			out[lane].write(serialize_cv_lane(&cv, lane).into());
 		}
 	}
 }
@@ -360,14 +380,148 @@ impl<const LANES: usize> ParallelDigest for PortableBlake3ParallelDigest<LANES> 
 	}
 }
 
+/// Folds up to `N` node pairs with a single batched Blake3 block compression.
+///
+/// Each pair is a 64-byte concatenation `left || right` of two 32-byte digests.
+/// That 64-byte message is exactly one Blake3 block.
+/// A one-block message makes its single block the first, last, and root block at once:
+/// - counter   = 0       (a single chunk).
+/// - block_len = 64      (a full block).
+/// - flags     = CHUNK_START | CHUNK_END | ROOT.
+///
+/// Folds `out.len()` pairs, which must be at most `N`.
+/// `inputs.len()` must be `2 * out.len()`.
+/// A partial batch leaves the unused high lanes zero.
+/// Their output is never read.
+#[inline]
+fn compress_node_pairs<const N: usize>(
+	inputs: &[Output<blake3::Hasher>],
+	out: &mut [MaybeUninit<Output<blake3::Hasher>>],
+) {
+	// Pack each pair into one 64-byte block: bytes 0..32 = left child, 32..64 = right child.
+	let mut blocks = [[0u8; BLOCK_LEN]; N];
+	for (lane, block) in blocks.iter_mut().enumerate().take(out.len()) {
+		block[..OUT_LEN].copy_from_slice(inputs[2 * lane].as_slice());
+		block[OUT_LEN..].copy_from_slice(inputs[2 * lane + 1].as_slice());
+	}
+
+	// One block compression seeded from the IV yields each pair's two-to-one digest.
+	let m = load_block_words(&blocks);
+	let mut cv = broadcast_iv::<N>();
+	compress_block(&mut cv, &m, 0, BLOCK_LEN as u32, CHUNK_START | CHUNK_END | ROOT);
+
+	for (lane, slot) in out.iter_mut().enumerate() {
+		slot.write(serialize_cv_lane(&cv, lane).into());
+	}
+}
+
+/// Parallel Blake3 two-to-one compression backed by the portable auto-vectorized kernel.
+///
+/// The Merkle inner-node counterpart to the leaf digest [`PortableBlake3ParallelDigest`].
+/// Every parent folds a pair of 32-byte child digests as `blake3(left || right)`.
+/// A batch of `LANES` node pairs is a fixed-length batched Blake3 over 64-byte messages.
+/// Each batch runs through the shared block-compression core in one pass.
+///
+/// Output is bit-identical to the scalar [`Blake3Compression`], pinned to it in tests.
+#[derive(Debug, Clone, Default)]
+pub struct PortableBlake3ParallelCompression<const LANES: usize> {
+	/// The scalar two-to-one function this batched path reproduces, exposed via `compression()`.
+	compression: Blake3Compression,
+}
+
+impl<const LANES: usize> ParallelPseudoCompression<Output<blake3::Hasher>, 2>
+	for PortableBlake3ParallelCompression<LANES>
+{
+	type Compression = Blake3Compression;
+
+	fn compression(&self) -> &Self::Compression {
+		&self.compression
+	}
+
+	fn parallel_compress(
+		&self,
+		inputs: &[Output<blake3::Hasher>],
+		out: &mut [MaybeUninit<Output<blake3::Hasher>>],
+	) {
+		assert_eq!(inputs.len(), 2 * out.len(), "Input length must be 2 * output length");
+
+		// Fold `LANES` pairs per batch.
+		// A shorter trailing batch is fine: the kernel only reads its valid lanes.
+		inputs
+			.par_chunks(2 * LANES)
+			.zip(out.par_chunks_mut(LANES))
+			.for_each(|(in_batch, out_batch)| compress_node_pairs::<LANES>(in_batch, out_batch));
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::iter::repeat_with;
 
 	use binius_utils::rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+	use proptest::prelude::*;
 	use rand::{Rng, SeedableRng, rngs::StdRng};
 
-	use super::*;
+	use super::{super::compress::CompressionFunction, *};
+
+	/// Folds `pairs` through the `N`-lane portable compression.
+	/// Pins every output bit-identical to the scalar [`Blake3Compression`].
+	fn check_parallel_compression<const N: usize>(pairs: &[[[u8; OUT_LEN]; 2]]) {
+		// Flatten pairs to the `[left_0, right_0, left_1, ...]` layout the compressor reads.
+		let inputs: Vec<Output<blake3::Hasher>> = pairs
+			.iter()
+			.flat_map(|[l, r]| [(*l).into(), (*r).into()])
+			.collect();
+		let mut out = repeat_with(MaybeUninit::<Output<blake3::Hasher>>::uninit)
+			.take(pairs.len())
+			.collect::<Vec<_>>();
+
+		PortableBlake3ParallelCompression::<N>::default().parallel_compress(&inputs, &mut out);
+
+		// Invariant: each batched lane equals the scalar two-to-one of the same pair.
+		for (slot, [l, r]) in out.into_iter().zip(pairs) {
+			let expected = Blake3Compression.compress([(*l).into(), (*r).into()]);
+			assert_eq!(unsafe { slot.assume_init() }.as_slice(), expected.as_slice());
+		}
+	}
+
+	#[test]
+	fn test_parallel_compression_boundaries() {
+		// Extreme digests exercise all-zero and all-ones message blocks in every left/right slot.
+		let zero = [0u8; OUT_LEN];
+		let ones = [0xffu8; OUT_LEN];
+		check_parallel_compression::<16>(&[[zero, zero], [ones, ones], [zero, ones], [ones, zero]]);
+
+		// Counts straddling the 16-lane batch boundary: empty, single, full, full+1, multi+partial.
+		let mut rng = StdRng::seed_from_u64(7);
+		for count in [0usize, 1, 15, 16, 17, 33] {
+			let pairs: Vec<[[u8; OUT_LEN]; 2]> = (0..count)
+				.map(|_| {
+					let mut pair = [[0u8; OUT_LEN]; 2];
+					rng.fill_bytes(&mut pair[0]);
+					rng.fill_bytes(&mut pair[1]);
+					pair
+				})
+				.collect();
+			check_parallel_compression::<16>(&pairs);
+		}
+	}
+
+	proptest! {
+		#[test]
+		fn parallel_compression_matches_scalar(
+			pairs in prop::collection::vec(
+				(prop::array::uniform32(any::<u8>()), prop::array::uniform32(any::<u8>())),
+				0..40usize,
+			),
+		) {
+			// The batch path is bit-identical to the scalar reference, at every vectorizer width.
+			let pairs: Vec<[[u8; OUT_LEN]; 2]> = pairs.into_iter().map(|(l, r)| [l, r]).collect();
+			check_parallel_compression::<4>(&pairs);
+			check_parallel_compression::<8>(&pairs);
+			check_parallel_compression::<16>(&pairs);
+		}
+	}
 
 	/// Runs `N` equal-length messages of `len` bytes through the portable batch and pins each lane
 	/// to the scalar reference.

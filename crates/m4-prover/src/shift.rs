@@ -97,7 +97,10 @@ mod tests {
 		inner_product::inner_product_buffers,
 		multilinear::eq::{eq_ind_partial_eval, eq_ind_partial_eval_scalars},
 	};
-	use binius_prover::{fold_word::fold_words, protocols::shift::build_key_collection};
+	use binius_prover::{
+		fold_word::fold_words,
+		protocols::shift::{OperatorData, build_key_collection, prove_batch},
+	};
 	use binius_transcript::ProverTranscript;
 	use binius_utils::checked_arithmetics::checked_log_2;
 	use binius_verifier::config::{B128, StdChallenger};
@@ -255,6 +258,45 @@ mod tests {
 		let (honest, prove_eval, verify_eval) = run_chain(&inputs);
 		assert_eq!(prove_eval, verify_eval);
 		assert_eq!(prove_eval, honest);
+	}
+
+	#[test]
+	#[should_panic(expected = "per-instance committed-word count")]
+	fn prove_batch_rejects_short_instance_slice() {
+		let c = and_circuit();
+		let cs = prepared_cs(&c);
+		let key_collection = build_key_collection(&cs);
+
+		// Fixture state: K = 2 instances, both satisfying.
+		let table = populate_table(&c, &[(1, 3, 7), (5, 6, 0)]);
+		let full: Vec<&[Word]> = (0..table.n_instances())
+			.map(|i| table.instance(i))
+			.collect();
+
+		// Mutation: truncate instance 1 to one word short of the per-instance committed count.
+		//
+		//     instance 0: [ w_0 .. w_{n-1} ]      (full)
+		//     instance 1: [ w_0 .. w_{n-2} ]      (one short) -> fold would read past its end
+		let n_words = key_collection.n_words();
+		let short = &full[1][..n_words - 1];
+		let instances = [full[0], short];
+
+		// A minimal operand claim; the length guard fires before any of it is used.
+		let bitand_data = OperatorData {
+			evals: vec![B128::default(); 3],
+			r_zhat_prime: B128::default(),
+			r_x_prime: Vec::new(),
+		};
+		let r_kappa = [B128::default()];
+
+		let mut transcript = ProverTranscript::new(StdChallenger::default());
+		let _ = prove_batch::<B128, P, _>(
+			&key_collection,
+			&instances,
+			&r_kappa,
+			bitand_data,
+			&mut transcript,
+		);
 	}
 
 	#[test]

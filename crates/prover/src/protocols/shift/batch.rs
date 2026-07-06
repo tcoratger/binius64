@@ -83,6 +83,8 @@ const LOG_LEN: usize = LOG_WORD_SIZE_BITS + LOG_WORD_SIZE_BITS;
 /// # Panics
 ///
 /// Panics if the instance count is not `2^{r_kappa.len()}`.
+/// Panics if any instance slice is shorter than the per-instance committed-word count.
+/// In debug builds, panics if the key collection holds any non-BitAnd key.
 #[instrument(skip_all, name = "batch_shift_prove")]
 pub fn prove_batch<F, P, Channel>(
 	key_collection: &KeyCollection,
@@ -100,8 +102,27 @@ where
 	let n_instances = 1usize << r_kappa.len();
 	assert_eq!(instances.len(), n_instances, "instance count must be 2^r_kappa.len()");
 
+	// This reduction covers BitAnd operands only.
+	// A non-BitAnd key would be silently skipped, leaving its operand claim unreduced.
+	debug_assert!(
+		key_collection
+			.public
+			.keys
+			.iter()
+			.chain(&key_collection.hidden.keys)
+			.all(|key| key.operation == Operation::BitwiseAnd),
+		"batched shift reduction handles BitAnd only: the constraint system must have no MUL constraints"
+	);
+
 	// Every committed word of a single instance, across both value-vector segments.
 	let n_words = key_collection.n_words();
+
+	// Each instance slice must hold at least the whole per-instance committed witness.
+	// The fold reads word y of every instance, for y in 0..n_words.
+	assert!(
+		instances.iter().all(|words| words.len() >= n_words),
+		"each instance slice must hold at least the per-instance committed-word count"
+	);
 
 	// Sample the operand-batching coefficient for (a, b, c).
 	// Only BitAnd is reduced here, so a single lambda suffices.

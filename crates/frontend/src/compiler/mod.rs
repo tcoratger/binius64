@@ -1014,28 +1014,6 @@ impl CircuitBuilder {
 		(hi, lo)
 	}
 
-	/// 64-bit × 64-bit → 128-bit signed multiplication.
-	///
-	/// Performs signed integer multiplication of two 64-bit values, producing
-	/// a 128-bit result split into high and low 64-bit words. Correctly handles
-	/// two's complement signed integers including overflow cases.
-	///
-	/// Returns `(hi, lo)` where the signed multiplication result equals `(hi << 64) | lo`.
-	/// The high word is sign-extended based on the product's sign.
-	///
-	/// # Cost
-	///
-	/// - 1 MUL constraint
-	/// - 7 AND constraints (2 for sign corrections, 4 for modular additions, 1 for low word
-	///   equality).
-	pub fn smul(&self, a: Wire, b: Wire) -> (Wire, Wire) {
-		let hi = self.add_internal();
-		let lo = self.add_internal();
-		let mut graph = self.graph_mut();
-		graph.emit_gate(self.current_path, Opcode::Smul, [a, b], [hi, lo]);
-		(hi, lo)
-	}
-
 	/// Conditional equality assertion.
 	///
 	/// Asserts that two 64-bit wires are equal only when a condition is true (MSB = 1).

@@ -26,6 +26,7 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 
 mod compiler;
+pub mod ops;
 pub mod stat;
 
 pub mod util;

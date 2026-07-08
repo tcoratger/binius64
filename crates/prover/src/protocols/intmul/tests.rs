@@ -1,12 +1,18 @@
 // Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 
 use binius_core::word::Word;
 use binius_field::{BinaryField128bGhash, PackedBinaryGhash2x128b, Random};
+use binius_iop::{channel::OracleSpec, naive_channel::NaiveVerifierChannel};
+use binius_iop_prover::naive_channel::NaiveProverChannel;
 use binius_math::{inner_product::inner_product_buffers, multilinear::eq::eq_ind_partial_eval};
 use binius_transcript::ProverTranscript;
 use binius_verifier::{
 	config::{LOG_WORD_SIZE_BITS, StdChallenger},
-	protocols::intmul::{common::IntMulOutput, verify},
+	protocols::intmul::{
+		common::{IntMulOutput, LIMB_BITS},
+		verify,
+	},
 };
 use itertools::izip;
 use rand::prelude::*;
@@ -17,17 +23,12 @@ use crate::fold_word::fold_words;
 type F = BinaryField128bGhash;
 type P = PackedBinaryGhash2x128b;
 
-pub fn evaluate_witness(words: &[u64], eval_point: &[F]) -> F {
-	let words = words
-		.iter()
-		.map(|&word| Word::from_u64(word))
-		.collect::<Vec<_>>();
-
+pub fn evaluate_witness(words: &[Word], eval_point: &[F]) -> F {
 	let (prefix, suffix) = eval_point.split_at(LOG_WORD_SIZE_BITS);
 	let prefix_tensor = eq_ind_partial_eval::<F>(prefix);
 	let suffix_tensor = eq_ind_partial_eval::<F>(suffix);
 
-	let partially_folded_witness = fold_words::<_, F>(&words, prefix_tensor.as_ref());
+	let partially_folded_witness = fold_words::<_, F>(words, prefix_tensor.as_ref());
 
 	inner_product_buffers(&partially_folded_witness, &suffix_tensor)
 }
@@ -52,17 +53,24 @@ fn prove_and_verify() {
 		let c_lo_i = full_result as u64;
 		let c_hi_i = (full_result >> 64) as u64;
 
-		a.push(a_i);
-		b.push(b_i);
-		c_lo.push(c_lo_i);
-		c_hi.push(c_hi_i);
+		a.push(Word::from_u64(a_i));
+		b.push(Word::from_u64(b_i));
+		c_lo.push(Word::from_u64(c_lo_i));
+		c_hi.push(Word::from_u64(c_hi_i));
 	}
 
-	let witness = Witness::<P, _, _>::new(LOG_WORD_SIZE_BITS, &a, &b, &c_lo, &c_hi).unwrap();
+	let witness = Witness::<P>::new(&a, &b, &c_lo, &c_hi).unwrap();
+
+	// The one oracle in the protocol is the logup* pushforward, over the table variables.
+	let oracle_specs = [OracleSpec::new(LIMB_BITS)];
+
 	// Run prover
 	let mut prover_transcript = ProverTranscript::<StdChallenger>::default();
-	let mut prover = IntMulProver::new(0, &mut prover_transcript);
-	let prove_output = prover.prove(witness).unwrap();
+	let mut prover_channel =
+		NaiveProverChannel::<F, _>::new(&mut prover_transcript, oracle_specs.to_vec());
+	let mut prover = IntMulProver::new(0, &mut prover_channel);
+	let prove_output = prover.prove(witness);
+	prover_channel.finish();
 
 	let IntMulOutput {
 		eval_point,
@@ -97,8 +105,9 @@ fn prove_and_verify() {
 	}
 	// Run verifier
 	let mut verifier_transcript = prover_transcript.into_verifier();
-	let verify_output =
-		verify(LOG_WORD_SIZE_BITS, LOG_EXPONENTS, &mut verifier_transcript).unwrap();
+	let mut verifier_channel = NaiveVerifierChannel::new(&mut verifier_transcript, &oracle_specs);
+	let verify_output = verify(LOG_EXPONENTS, &mut verifier_channel).unwrap();
+	verifier_channel.finish();
 
 	// Check verifier output is consistent with prover output
 	assert_eq!(prove_output, verify_output);

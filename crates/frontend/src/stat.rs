@@ -1,4 +1,5 @@
 // Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 
 //! Circuit statistics module for analyzing constraint counts and circuit complexity.
 
@@ -94,7 +95,7 @@ impl CircuitStat {
 		let public_allocated = cs.value_vec_layout.offset_witness;
 		// The committed values are not padded to a power of two in the layout, but the prover
 		// commits to a power-of-two-length witness polynomial, so report that padded size.
-		let total_allocated = cs.value_vec_layout.committed_total_len.next_power_of_two();
+		let total_allocated = cs.value_vec_layout.combined_len().next_power_of_two();
 		let private_allocated = total_allocated - public_allocated;
 
 		Self {
@@ -189,12 +190,20 @@ impl fmt::Display for CircuitStat {
 			0.0
 		};
 		let mul_spare = self.mul_allocated - self.n_mul_constraints;
+		// A circuit with no MUL constraints allocates nothing (the IntMul reduction is skipped),
+		// so there is no power-of-two allocation to report — unlike AND, which is always padded to
+		// at least one.
+		let mul_allocation = if self.mul_allocated == 0 {
+			"0".to_string()
+		} else {
+			format!("2^{}", log2(self.mul_allocated))
+		};
 		writeln!(
 			f,
-			"├─ MUL constraints: {} used ({:.1}% of 2^{})",
+			"├─ MUL constraints: {} used ({:.1}% of {})",
 			fmt_num(self.n_mul_constraints),
 			mul_percent,
-			log2(self.mul_allocated)
+			mul_allocation
 		)?;
 		writeln!(
 			f,

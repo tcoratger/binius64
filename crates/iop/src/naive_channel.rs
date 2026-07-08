@@ -135,11 +135,11 @@ where
 	}
 
 	fn compute_public_value(&mut self, inputs: &[F], f: impl FieldFn<F>) -> F {
-		f.call::<F>(inputs)
+		f.call_native(inputs)
 	}
 }
 
-impl<'r, F, Challenger_> IOPVerifierChannel<'r, F> for NaiveVerifierChannel<'_, F, Challenger_>
+impl<F, Challenger_> IOPVerifierChannel<F> for NaiveVerifierChannel<'_, F, Challenger_>
 where
 	F: Field,
 	Challenger_: Challenger,
@@ -181,7 +181,7 @@ where
 
 	fn verify_oracle_relations(
 		&mut self,
-		oracle_relations: impl IntoIterator<Item = OracleLinearRelation<'r, Self::Oracle, F>>,
+		oracle_relations: impl IntoIterator<Item = OracleLinearRelation<Self::Oracle, F>>,
 	) -> Result<(), Error> {
 		for relation in oracle_relations {
 			let index = relation.oracle.index;

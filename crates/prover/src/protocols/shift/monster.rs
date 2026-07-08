@@ -1,14 +1,15 @@
 // Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 
-use std::{iter, ops::Range};
+use std::iter;
 
-use binius_field::{AESTowerField8b, BinaryField, Field, PackedField};
+use binius_field::{BinaryField, Field, PackedField, WideMul};
 use binius_math::{
 	BinarySubspace, FieldBuffer, multilinear::eq::eq_ind_partial_eval, univariate::lagrange_evals,
 };
-use binius_utils::{checked_arithmetics::log2_ceil_usize, rayon::prelude::*};
+use binius_utils::{checked_arithmetics::checked_log_2, rayon::prelude::*};
 use binius_verifier::{
-	config::{LOG_WORD_SIZE_BITS, LOG_WORDS_PER_ELEM, WORD_SIZE_BITS},
+	config::WORD_SIZE_BITS,
 	protocols::shift::{BITAND_ARITY, INTMUL_ARITY, evaluate_h_op},
 };
 use bytemuck::zeroed_vec;
@@ -16,8 +17,7 @@ use tracing::instrument;
 
 use super::{
 	SHIFT_VARIANT_COUNT,
-	error::Error,
-	key_collection::{KeyCollection, Operation},
+	key_collection::{KeyCollection, KeySegment, Operation},
 	prove::PreparedOperatorData,
 };
 
@@ -32,13 +32,13 @@ use super::{
 /// Used in phase 1, thus returning an array of multilinear evaluations.
 #[instrument(skip_all, name = "build_h_parts")]
 pub fn build_h_parts<F, P: PackedField<Scalar = F>>(
+	domain_subspace: &BinarySubspace<F>,
 	r_zhat_prime: F,
 ) -> [FieldBuffer<P>; SHIFT_VARIANT_COUNT]
 where
-	F: BinaryField + From<AESTowerField8b>,
+	F: BinaryField,
 {
-	let subspace = BinarySubspace::<AESTowerField8b>::with_dim(LOG_WORD_SIZE_BITS).isomorphic();
-	let l_tilde = lagrange_evals(&subspace, r_zhat_prime);
+	let l_tilde = lagrange_evals(domain_subspace, r_zhat_prime);
 	let l_tilde = l_tilde.as_ref();
 
 	fn build_part<F: Field, P: PackedField<Scalar = F>>(
@@ -123,52 +123,56 @@ where
 ///
 /// For each word w, computes:
 /// ```text
-/// ∑_{key ∈ keys[w]} key.accumulate(constraint_indices, tensor) × scalars[key.id]
+/// ∑_{key ∈ keys[w]} key.accumulate(constraint_indices, tensor, scalars[key.id])
 /// ```
-/// where the scalars encode `λ^(operand_idx+1) × h_op[shift_variant] × r_s_tensor[shift_amount]`
-/// for operand index `operand_idx` and `shift_variant` in {SLL, SRL, SRA} and `shift_amount` in
-/// [0, WORD_SIZE_BITS).
+/// where `scalars[key.id]` is the contiguous per-operand chunk encoding
+/// `λ^(operand_idx+1) × h_op[shift_variant] × r_s_tensor[shift_amount]` for operand index
+/// `operand_idx` and `shift_variant` in {SLL, SRL, SRA} and `shift_amount` in [0, WORD_SIZE_BITS).
 ///
 /// # Usage
 ///
-/// Used in phase 2 of the shift protocol where the prover needs a single multilinear combining
-/// all shift-related constraints for efficient sumcheck computation.
-#[instrument(skip_all, name = "build_monster_multilinear")]
-pub fn build_monster_multilinear<F, P: PackedField<Scalar = F>>(
+/// Used in phase 2 of the shift protocol. The two returned buffers are the segments of the
+/// witness's monster multilinear: the public piece over `log_public_words` variables and the
+/// hidden piece over `log_witness_words` variables (the hidden words at the base, zeros above).
+/// The sparse first sumcheck round consumes them without materializing the combined buffer.
+#[instrument(skip_all, name = "build_monster_segments")]
+pub fn build_monster_segments<F, P: PackedField<Scalar = F>>(
 	key_collection: &KeyCollection,
 	bitand_operator_data: &PreparedOperatorData<F>,
 	intmul_operator_data: &PreparedOperatorData<F>,
+	domain_subspace: &BinarySubspace<F>,
 	r_j: &[F],
 	r_s: &[F],
-) -> Result<FieldBuffer<P>, Error>
+) -> (FieldBuffer<P>, FieldBuffer<P>)
 where
-	F: BinaryField + From<AESTowerField8b>,
+	F: BinaryField,
 {
 	// Compute h evaluations
-	let subspace = BinarySubspace::<AESTowerField8b>::with_dim(LOG_WORD_SIZE_BITS).isomorphic();
 	let [bitand_h_ops, intmul_h_ops] = [
 		bitand_operator_data.r_zhat_prime,
 		intmul_operator_data.r_zhat_prime,
 	]
 	.map(|r_zhat_prime| {
-		let l_tilde = lagrange_evals(&subspace, r_zhat_prime);
+		let l_tilde = lagrange_evals(domain_subspace, r_zhat_prime);
 		evaluate_h_op(l_tilde.as_ref(), r_j, r_s)
 	});
 
 	let r_s_tensor = eq_ind_partial_eval::<F>(r_s);
 
-	// Allocate and populate the scalars
+	// Allocate and populate the scalars, laid out with the operand index innermost so that the
+	// `arity` weights for one `key.id` (= `op * WORD_SIZE_BITS + s`) form a contiguous chunk that
+	// [`Key::accumulate`] can index directly by operand index.
 	let mut bitand_scalars = vec![F::ZERO; BITAND_ARITY * SHIFT_VARIANT_COUNT * WORD_SIZE_BITS];
 	let mut intmul_scalars = vec![F::ZERO; INTMUL_ARITY * SHIFT_VARIANT_COUNT * WORD_SIZE_BITS];
 
 	let populate_scalars = |scalars: &mut [F], arity: usize, lambda_powers: &[F], h_ops: &[F]| {
-		for operand_idx in 0..arity {
-			for op in 0..SHIFT_VARIANT_COUNT {
-				let operand_op_idx = operand_idx * SHIFT_VARIANT_COUNT + op;
-				let operand_op_scalar = lambda_powers[operand_idx] * h_ops[op];
-				for s in 0..WORD_SIZE_BITS {
-					let operand_op_s_idx = operand_op_idx * WORD_SIZE_BITS + s;
-					scalars[operand_op_s_idx] = operand_op_scalar * r_s_tensor.as_ref()[s];
+		for op in 0..SHIFT_VARIANT_COUNT {
+			for s in 0..WORD_SIZE_BITS {
+				let key_id = op * WORD_SIZE_BITS + s;
+				let op_s_scalar = h_ops[op] * r_s_tensor.as_ref()[s];
+				for operand_idx in 0..arity {
+					scalars[key_id * arity + operand_idx] =
+						lambda_powers[operand_idx] * op_s_scalar;
 				}
 			}
 		}
@@ -187,45 +191,66 @@ where
 		&intmul_h_ops,
 	);
 
-	let n_words = key_collection.key_ranges.len();
-	let log_len = log2_ceil_usize(n_words).max(LOG_WORDS_PER_ELEM);
-	let capacity = 1 << log_len.saturating_sub(P::LOG_WIDTH);
+	// The scalar for one word of a segment: the accumulated contribution of all its keys. The
+	// per-key wide accumulations are summed unreduced and reduced once at the end.
+	let word_scalar = |segment: &KeySegment, index: usize| {
+		let wide = segment
+			.word_keys(index)
+			.iter()
+			.map(|key| {
+				let (operator_data, scalars, arity) = match key.operation {
+					Operation::BitwiseAnd => (bitand_operator_data, &bitand_scalars, BITAND_ARITY),
+					Operation::IntegerMul => (intmul_operator_data, &intmul_scalars, INTMUL_ARITY),
+				};
+				let base = key.id as usize * arity;
+				key.accumulate_wide(
+					&segment.constraint_indices,
+					operator_data.r_x_prime_tensor.as_ref(),
+					&scalars[base..base + arity],
+				)
+			})
+			.sum::<<F as WideMul>::Output>();
+		F::reduce(wide)
+	};
 
-	let mut monster_multilinear = Vec::<P>::with_capacity(capacity);
-	key_collection
-		.key_ranges
-		.par_chunks(P::WIDTH)
-		.map(|chunk| {
-			P::from_scalars(chunk.iter().map(|&Range { start, end }| {
-				key_collection.keys[start as usize..end as usize]
-					.iter()
-					.map(|key| {
-						let (operator_data, scalars) = match key.operation {
-							Operation::BitwiseAnd => (bitand_operator_data, &bitand_scalars),
-							Operation::IntegerMul => (intmul_operator_data, &intmul_scalars),
-						};
-						key.accumulate_by_operand(&key_collection.constraint_indices, operator_data)
-							.map(|(operand_index, acc)| {
-								let index = key.id as usize
-									+ operand_index * SHIFT_VARIANT_COUNT * WORD_SIZE_BITS;
-								acc * scalars[index]
-							})
-							.sum::<F>()
-					})
-					.sum()
-			}))
-		})
-		.collect_into_vec(&mut monster_multilinear);
-	monster_multilinear.resize(capacity, P::default());
+	// Each segment sits at the base of its buffer: the public piece fills its power-of-two
+	// length exactly, the hidden piece is zero-padded up to the hidden segment length.
+	let build_segment = |segment: &KeySegment, log_len: usize| {
+		let capacity = 1 << log_len.saturating_sub(P::LOG_WIDTH);
+		let n_words = segment.n_words();
+		// Full packed elements: each maps exactly `P::WIDTH` words, so `from_scalars` sees a
+		// statically-sized iterator. The trailing partial element is filled separately below.
+		let n_full = n_words / P::WIDTH;
+		let mut values = Vec::<P>::with_capacity(capacity);
+		(0..n_full)
+			.into_par_iter()
+			.map(|chunk_index| {
+				let start = chunk_index * P::WIDTH;
+				P::from_scalars((0..P::WIDTH).map(|i| word_scalar(segment, start + i)))
+			})
+			.collect_into_vec(&mut values);
+		if !n_words.is_multiple_of(P::WIDTH) {
+			let start = n_full * P::WIDTH;
+			values.push(P::from_scalars(
+				(start..n_words).map(|word_index| word_scalar(segment, word_index)),
+			));
+		}
+		values.resize(capacity, P::default());
+		FieldBuffer::new(log_len, values.into_boxed_slice())
+	};
 
-	Ok(FieldBuffer::new(log_len, monster_multilinear.into_boxed_slice()))
+	let log_public_words = checked_log_2(key_collection.public.n_words());
+	let public_monster = build_segment(&key_collection.public, log_public_words);
+	let hidden_monster = build_segment(&key_collection.hidden, key_collection.log_witness_words());
+
+	(public_monster, hidden_monster)
 }
 
 #[cfg(test)]
 mod tests {
-	use binius_field::{BinaryField128bGhash, PackedBinaryGhash2x128b, Random};
+	use binius_field::{AESTowerField8b, BinaryField128bGhash, PackedBinaryGhash2x128b, Random};
 	use binius_math::{inner_product::inner_product_buffers, multilinear::eq::eq_ind_partial_eval};
-	use binius_verifier::protocols::shift::evaluate_h_op;
+	use binius_verifier::{config::LOG_WORD_SIZE_BITS, protocols::shift::evaluate_h_op};
 	use rand::{SeedableRng, rngs::StdRng};
 
 	use super::*;
@@ -254,7 +279,7 @@ mod tests {
 			let succinct_evaluations = evaluate_h_op(l_tilde.as_ref(), &r_j, &r_s);
 
 			// Method 2: Direct evaluation via multilinear part
-			let h_parts = build_h_parts(r_zhat_prime);
+			let h_parts = build_h_parts(&subspace, r_zhat_prime);
 			let evaluation_point: Vec<F> = [r_j.clone(), r_s.clone()].concat();
 			let tensor = eq_ind_partial_eval::<P>(&evaluation_point);
 			let direct_evaluations = h_parts.map(|buf| inner_product_buffers(&buf, &tensor));

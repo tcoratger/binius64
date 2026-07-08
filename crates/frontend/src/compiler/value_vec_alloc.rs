@@ -1,4 +1,5 @@
 // Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 use binius_core::{ValueIndex, ValueVecLayout, Word, consts::MIN_WORDS_PER_SEGMENT};
 use cranelift_entity::SecondaryMap;
 
@@ -105,7 +106,11 @@ impl Alloc {
 			cur_index += 1;
 		}
 
-		let committed_total_len = cur_index as usize;
+		// Pad the hidden segment to at least the public segment length, so
+		// `log_witness_words >= log_public_words` (see `ValueVecLayout::validate`).
+		cur_index = cur_index.max(2 * offset_witness as u32);
+
+		let n_hidden_words = cur_index as usize - offset_witness;
 
 		for wire in self.w_scratch {
 			wire_mapping[wire] = ValueIndex(cur_index);
@@ -119,7 +124,7 @@ impl Alloc {
 			n_internal,
 			offset_inout,
 			offset_witness,
-			committed_total_len,
+			n_hidden_words,
 			n_scratch,
 		};
 
@@ -219,14 +224,8 @@ mod tests {
 		assert_eq!(assignment.value_vec_layout.n_internal, 1);
 		assert_eq!(assignment.value_vec_layout.offset_inout, 3);
 		assert_eq!(assignment.value_vec_layout.offset_witness, witness1_idx.0 as usize);
-		// The committed length is exactly the public section (padded) plus the witness and
-		// internal values.
-		assert_eq!(
-			assignment.value_vec_layout.committed_total_len,
-			assignment.value_vec_layout.offset_witness
-				+ assignment.value_vec_layout.n_witness
-				+ assignment.value_vec_layout.n_internal
-		);
+		// The witness segment is padded from 4 words up to the public segment length (8).
+		assert_eq!(assignment.value_vec_layout.n_hidden_words, 8);
 	}
 
 	#[test]

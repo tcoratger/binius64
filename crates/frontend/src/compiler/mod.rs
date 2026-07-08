@@ -12,10 +12,7 @@ use crate::compiler::{
 	circuit::Circuit,
 	constraint_builder::ConstraintBuilder,
 	gate_graph::{GateGraph, WireKind},
-	hints::{
-		BigUintDivideHint, BigUintModPowHint, Hint, HintRegistry, ModDivideHint, ModInverseHint,
-		Secp256k1EndosplitHint,
-	},
+	hints::{Hint, HintRegistry},
 	pathspec::PathSpec,
 };
 
@@ -25,6 +22,7 @@ use gate::Opcode;
 pub mod circuit;
 pub mod const_prop;
 pub mod constraint_builder;
+mod cse;
 mod dce;
 mod dump;
 pub mod eval_form;
@@ -42,6 +40,7 @@ pub use gate_graph::Wire;
 pub(crate) struct Options {
 	enable_gate_fusion: bool,
 	enable_constant_propagation: bool,
+	enable_common_subexpression_elimination: bool,
 	enable_dead_code_elimination: bool,
 	enable_algebraic_folding: bool,
 }
@@ -53,6 +52,7 @@ impl Default for Options {
 		Self {
 			enable_gate_fusion: true,
 			enable_constant_propagation: false,
+			enable_common_subexpression_elimination: true,
 			enable_dead_code_elimination: true,
 			enable_algebraic_folding: true,
 		}
@@ -68,6 +68,9 @@ impl Options {
 		let mut opts = Self::default();
 		if std::env::var("MONBIJOU_CONSTPROP").is_ok() {
 			opts.enable_constant_propagation = true;
+		}
+		if std::env::var("BINIUS_DISABLE_CSE").is_ok() {
+			opts.enable_common_subexpression_elimination = false;
 		}
 		if std::env::var("BINIUS_DISABLE_DCE").is_ok() {
 			opts.enable_dead_code_elimination = false;
@@ -228,6 +231,13 @@ impl CircuitBuilder {
 			}
 		}
 
+		// Common-subexpression elimination: collapse structurally-identical gates.
+		// This runs first so the dead-code pass sees the canonicalized graph.
+		let dead_gates = shared
+			.opts
+			.enable_common_subexpression_elimination
+			.then(|| cse::dedup_gates(&mut graph, &shared.force_committed, &shared.hint_registry));
+
 		// Dead-code elimination: the gates that can affect the constraint system.
 		// A gate outside this set emits no constraint and no committed wire, so it is skipped
 		// below.
@@ -238,6 +248,12 @@ impl CircuitBuilder {
 
 		let mut builder = ConstraintBuilder::new();
 		for (gate_id, _) in graph.gates.iter() {
+			// Drop collapsed duplicates: their outputs are now read through the canonical gate.
+			if let Some(dead_gates) = &dead_gates
+				&& dead_gates.contains(gate_id)
+			{
+				continue;
+			}
 			// Drop dead gates: they would only add constraints on wires that nothing reads.
 			if let Some(live_gates) = &live_gates
 				&& !live_gates.contains(gate_id)
@@ -366,6 +382,20 @@ impl CircuitBuilder {
 		RefMut::map(self.shared.borrow_mut(), |shared| &mut shared.as_mut().unwrap().graph)
 	}
 
+	/// The compile-time value of a wire, when it is a constant.
+	///
+	/// Returns `None` for inputs, witnesses, and gate outputs whose value is only known at
+	/// proving time.
+	/// Used by the builder to fold trivial gate identities at construction.
+	fn const_of(&self, wire: Wire) -> Option<Word> {
+		let shared = self.shared.borrow();
+		let shared = shared.as_ref().expect("CircuitBuilder used after build");
+		match shared.graph.wires[wire].kind {
+			WireKind::Constant(word) => Some(word),
+			_ => None,
+		}
+	}
+
 	/// Creates a wire from a 64-bit word.
 	///
 	/// # Arguments
@@ -466,6 +496,16 @@ impl CircuitBuilder {
 		if self.algebraic_folding() && x == y {
 			return x;
 		}
+		// Identities that hold bit for bit, so they need no AND constraint:
+		//   c & d  -> fold        0 & y -> 0        all-1 & y -> y
+		match (self.const_of(x), self.const_of(y)) {
+			(Some(a), Some(b)) => return self.add_constant(Word(a.0 & b.0)),
+			(Some(a), _) if a == Word::ZERO => return x,
+			(Some(a), _) if a == Word::ALL_ONE => return y,
+			(_, Some(b)) if b == Word::ZERO => return y,
+			(_, Some(b)) if b == Word::ALL_ONE => return x,
+			_ => {}
+		}
 		let z = self.add_internal();
 		let mut graph = self.graph_mut();
 		graph.emit_gate(self.current_path, Opcode::Band, [x, y], [z]);
@@ -483,6 +523,14 @@ impl CircuitBuilder {
 		// Self-inverse: x ^ x = 0, so return the zero constant and emit no gate.
 		if self.algebraic_folding() && a == b {
 			return self.add_constant(Word::ZERO);
+		}
+		// Identities that hold bit for bit, so they need no linear constraint:
+		//   c ^ d  -> fold        0 ^ b -> b        a ^ 0 -> a
+		match (self.const_of(a), self.const_of(b)) {
+			(Some(x), Some(y)) => return self.add_constant(Word(x.0 ^ y.0)),
+			(Some(x), _) if x == Word::ZERO => return b,
+			(_, Some(y)) if y == Word::ZERO => return a,
+			_ => {}
 		}
 		let z = self.add_internal();
 		let mut graph = self.graph_mut();
@@ -546,6 +594,16 @@ impl CircuitBuilder {
 		// Idempotent: x | x = x, bit for bit, so return x and emit no gate.
 		if self.algebraic_folding() && a == b {
 			return a;
+		}
+		// Identities that hold bit for bit, so they need no AND constraint:
+		//   c | d  -> fold        0 | b -> b        all-1 | b -> all-1
+		match (self.const_of(a), self.const_of(b)) {
+			(Some(x), Some(y)) => return self.add_constant(Word(x.0 | y.0)),
+			(Some(x), _) if x == Word::ZERO => return b,
+			(Some(x), _) if x == Word::ALL_ONE => return a,
+			(_, Some(y)) if y == Word::ZERO => return a,
+			(_, Some(y)) if y == Word::ALL_ONE => return b,
+			_ => {}
 		}
 		let z = self.add_internal();
 		let mut graph = self.graph_mut();
@@ -1002,28 +1060,6 @@ impl CircuitBuilder {
 		(hi, lo)
 	}
 
-	/// 64-bit × 64-bit → 128-bit signed multiplication.
-	///
-	/// Performs signed integer multiplication of two 64-bit values, producing
-	/// a 128-bit result split into high and low 64-bit words. Correctly handles
-	/// two's complement signed integers including overflow cases.
-	///
-	/// Returns `(hi, lo)` where the signed multiplication result equals `(hi << 64) | lo`.
-	/// The high word is sign-extended based on the product's sign.
-	///
-	/// # Cost
-	///
-	/// - 1 MUL constraint
-	/// - 7 AND constraints (2 for sign corrections, 4 for modular additions, 1 for low word
-	///   equality).
-	pub fn smul(&self, a: Wire, b: Wire) -> (Wire, Wire) {
-		let hi = self.add_internal();
-		let lo = self.add_internal();
-		let mut graph = self.graph_mut();
-		graph.emit_gate(self.current_path, Opcode::Smul, [a, b], [hi, lo]);
-		(hi, lo)
-	}
-
 	/// Conditional equality assertion.
 	///
 	/// Asserts that two 64-bit wires are equal only when a condition is true (MSB = 1).
@@ -1196,6 +1232,11 @@ impl CircuitBuilder {
 		if self.algebraic_folding() && t == f {
 			return t;
 		}
+		// A constant condition resolves the branch at compile time.
+		// The selector reads only the most significant bit (bit 63), the MSB-bool.
+		if let Some(c) = self.const_of(cond) {
+			return if (c.0 >> 63) == 1 { t } else { f };
+		}
 		let out = self.add_internal();
 		let mut graph = self.graph_mut();
 		graph.emit_gate(self.current_path, Opcode::Select, [cond, t, f], [out]);
@@ -1245,112 +1286,5 @@ impl CircuitBuilder {
 		);
 
 		outputs
-	}
-
-	/// BigUint division.
-	///
-	/// Returns `(quotient, remainder)` of the division of `dividend` by `divisor`.
-	///
-	/// This is a hint - a deterministic computation that happens only on the prover side.
-	/// The result should be additionally constrained by using bignum circuits to check that
-	/// `remainder + divisor * quotient == dividend`.
-	pub fn biguint_divide_hint(
-		&self,
-		dividend: &[Wire],
-		divisor: &[Wire],
-	) -> (Vec<Wire>, Vec<Wire>) {
-		let inputs: Vec<Wire> = dividend.iter().chain(divisor).copied().collect();
-		let mut out =
-			self.call_hint(BigUintDivideHint::new(), &[dividend.len(), divisor.len()], &inputs);
-		let remainder = out.split_off(dividend.len());
-		(out, remainder)
-	}
-
-	/// Modular exponentiation.
-	///
-	/// Computes `(base^exp) % modulus`.
-	/// This is a hint - a deterministic computation that happens only on the prover side.
-	/// The result should be additionally constrained using bignum circuits.
-	pub fn biguint_mod_pow_hint(&self, base: &[Wire], exp: &[Wire], modulus: &[Wire]) -> Vec<Wire> {
-		let inputs: Vec<Wire> = base.iter().chain(exp).chain(modulus).copied().collect();
-		self.call_hint(BigUintModPowHint::new(), &[base.len(), exp.len(), modulus.len()], &inputs)
-	}
-
-	/// Modular inverse.
-	///
-	/// Computes the modular inverse of `base` modulo `modulus`.
-	/// Returns a pair `(quotient, inverse)` where both numbers are Bézout coefficients when
-	/// `base` and `modulus` are coprime. Both numbers are set to zero if `gcd(base, modulus) > 1`.
-	///
-	/// This is a hint - a deterministic computation that happens only on the prover side.
-	/// The result should be additionally constrained by using bignum circuits to check that
-	/// `base * inverse = 1 + quotient * modulus`.
-	pub fn mod_inverse_hint(&self, base: &[Wire], modulus: &[Wire]) -> (Vec<Wire>, Vec<Wire>) {
-		let inputs: Vec<Wire> = base.iter().chain(modulus).copied().collect();
-		let mut out = self.call_hint(ModInverseHint::new(), &[base.len(), modulus.len()], &inputs);
-		let inverse = out.split_off(modulus.len());
-		(out, inverse)
-	}
-
-	/// Modular division.
-	///
-	/// Computes `dividend / divisor (mod modulus) = dividend * divisor^{-1} (mod modulus)`.
-	/// Returns a pair `(quotient, slope)` where `slope` is the modular quotient and `quotient`
-	/// is the non-negative integer satisfying `slope * divisor = dividend + quotient * modulus`.
-	/// Both are set to zero when `divisor` is not invertible modulo `modulus` (e.g. `divisor ==
-	/// 0`).
-	///
-	/// This is a hint - a deterministic computation that happens only on the prover side.
-	/// The result should be additionally constrained by using bignum circuits to check that
-	/// `slope * divisor = dividend + quotient * modulus`.
-	pub fn mod_divide_hint(
-		&self,
-		dividend: &[Wire],
-		divisor: &[Wire],
-		modulus: &[Wire],
-	) -> (Vec<Wire>, Vec<Wire>) {
-		let inputs: Vec<Wire> = dividend
-			.iter()
-			.chain(divisor)
-			.chain(modulus)
-			.copied()
-			.collect();
-		let mut out = self.call_hint(
-			ModDivideHint::new(),
-			&[dividend.len(), divisor.len(), modulus.len()],
-			&inputs,
-		);
-		let slope = out.split_off(modulus.len());
-		(out, slope)
-	}
-
-	/// Secp256k1 endomorphism split
-	///
-	/// The curve has an endomorphism `λ (x, y) = (βx, y)` where `λ³=1 (mod n)`
-	/// and `β³=1 (mod p)` (`n` being the scalar field modulus and `p` coordinate field one).
-	///
-	/// For a 256-bit scalar `k` it is possible to split it into `k1` and `k2` such that
-	/// `k1 + λ k2 = k (mod n)` and both `k1` and `k2` are no farther than `2^128` from zero.
-	///
-	/// The `k` scalar is represented by four 64-bit limbs in little endian order. The return value
-	/// is quadruple of `(k1_neg, k2_neg, k1_abs, k2_abs)` where `k1_neg` and `k2_neg` are
-	/// MSB-bools indicating whether `k1_abs` or `k2_abs`, respectively, should be negated.
-	/// `k1_abs` and `k2_abs` are at most 128 bits and are represented with two 64-bit limbs.
-	/// When `k` cannot be represented in this way (any valid scalar can, so it has to be modulus
-	/// or above), both `k1_abs` and `k2_abs` are assigned zero values.
-	///
-	/// This is a hint - a deterministic computation that happens only on the prover side.
-	/// The result should be additionally constrained by using bignum circuits to check that
-	/// `k1 + λ k2 = k (mod n)`.
-	pub fn secp256k1_endomorphism_split_hint(
-		&self,
-		k: &[Wire],
-	) -> (Wire, Wire, [Wire; 2], [Wire; 2]) {
-		assert_eq!(k.len(), 4);
-		let out = self.call_hint(Secp256k1EndosplitHint::new(), &[], k);
-		let [k1_neg, k2_neg, k1_abs0, k1_abs1, k2_abs0, k2_abs1] = out.as_slice() else {
-			panic!("Secp256k1EndosplitHint must return 6 wires");
-		};
-		(*k1_neg, *k2_neg, [*k1_abs0, *k1_abs1], [*k2_abs0, *k2_abs1])
 	}
 }

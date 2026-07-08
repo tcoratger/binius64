@@ -1,128 +1,156 @@
 // Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 
-use std::{iter, marker::PhantomData, mem::MaybeUninit, ops::Deref};
+use std::{iter, mem::MaybeUninit, ops::Deref};
 
+use binius_core::word::Word;
 use binius_field::{BinaryField, Field, PackedField};
+use binius_ip_prover::prodcheck::ProdcheckProver;
 use binius_math::field_buffer::FieldBuffer;
 use binius_utils::{
-	bitwise::{BitSelector, Bitwise},
 	checked_arithmetics::{checked_log_2, strict_log_2},
-	random_access_sequence::RandomAccessSequence,
 	rayon::prelude::*,
 	strided_array::StridedArray2DViewMut,
+};
+use binius_verifier::{
+	config::{LOG_WORD_SIZE_BITS, WORD_SIZE_BITS},
+	protocols::intmul::common::{LIMB_BITS, LOG_N_LIMBS, N_LIMBS},
 };
 use getset::Getters;
 use itertools::iterate;
 
 use super::error::Error;
-use crate::protocols::prodcheck::ProdcheckProver;
 
 /// An integer multiplication protocol witness. Created from integer slices, consumed during
 /// proving.
 ///
-/// The statement being proven is `a * b = c`, where `c` is represented as a pair `(c_lo, c_hi)`.
-/// All four values are of the same bit width that is passed to the prover via `log_bits` parameter
-/// (also denoted $m$). In Binius64, `log_bits = 6` for 64-bit multiplicands and 128-bit product.
+/// The statement being proven is `a * b = c`, where `c` is represented as a pair `(c_lo, c_hi)`:
+/// `WORD_SIZE_BITS`-wide multiplicands with a double-wide product.
 ///
-/// For each of `a`, `c_lo`, `c_hi`, `b` we build the `2^log_bits` "selected" leaf multilinears of
-/// the bivariate-product GKR tree (the widest layer), concatenated into one `(n_vars + log_bits)`
-/// variate buffer with the node index in the high bits. We then construct a [`ProdcheckProver`]
-/// over each, retaining the leaf layer for the final (Phase 5) GKR step:
-///  1) `a` and `c_lo` select a multiplicative group generator $G$
-///  2) `c_hi` selects $G^{2^{2^m}}$
-///  3) `b` selects variable base which is equal to the root of the `a` tree
+/// For each of `a`, `c_lo`, `c_hi` the exponent words split into `N_LIMBS` limbs, and the
+/// constant-base exponentiation factors as a product of `N_LIMBS` limb columns — column `l` reads
+/// the row `limb_l(e)` of the power table of the base $G^{2^{wl}}$ (where $w$ is the limb bit
+/// width). The columns are concatenated into one `(n_vars + LOG_N_LIMBS)`-variate buffer with the
+/// limb index in the high bits, and a [`ProdcheckProver`] is constructed over each:
+///  1) `a` and `c_lo` exponentiate the multiplicative group generator $G$
+///  2) `c_hi` exponentiates $G^{2^{2^m}}$
+///  3) `b` selects a variable base (the root of the `a` tree) per bit, over `WORD_SIZE_BITS`
+///     per-bit leaves as before
+///
+/// The shared power table $T\colon i \mapsto G^i$ over $2^w$ rows is retained for the Phase 5
+/// logup* lookup.
 ///
 /// Protocol proves that ${(G^a)}^b = G^{c\\_lo} \times (G^{2^{2^m}})^{c\\_hi}$, which is equivalent
 /// to $a \times b = c$ modulo $2^{2^{m+1}} - 1$. The special case of `0 * 0 = 1` is handled
 /// separately.
 #[derive(Clone, Getters)]
 #[getset(get = "pub")]
-pub struct Witness<P: PackedField, B: Bitwise, S: AsRef<[B]> + Sync> {
-	/// The log of the bit width ($m$): the tree leaf layer has `2^log_bits` selected multilinears.
-	pub log_bits: usize,
-	/// The exponents for `a` (needed for the phase 5 parity zerocheck on `a_0`).
-	pub a_exponents: S,
+pub struct Witness<'a, P: PackedField> {
+	/// The exponents for `a` (needed for the phase 5 lookup indices and parity zerocheck on
+	/// `a_0`).
+	#[getset(skip)]
+	pub a_exponents: &'a [Word],
 	/// Prodcheck prover for the `a` exponentiation tree (leaf layer retained).
 	pub a_prodcheck: ProdcheckProver<P>,
 	/// The root of the `a` tree (product of all leaves element-wise); the `b` variable base.
 	pub a_root: FieldBuffer<P>,
 	/// The exponents for `b` (needed for phase 5).
-	pub b_exponents: S,
+	#[getset(skip)]
+	pub b_exponents: &'a [Word],
 	/// Concatenated b leaves for prodcheck: [L_0, L_1, ..., L_{2^k-1}].
-	/// Has log_len = n_vars + log_bits.
+	/// Has log_len = n_vars + LOG_WORD_SIZE_BITS.
 	pub b_leaves: FieldBuffer<P>,
 	/// The prover for the prodcheck reduction on b_leaves.
 	pub b_prodcheck: ProdcheckProver<P>,
 	/// The root of the b tree (product of all leaves element-wise).
 	pub b_root: FieldBuffer<P>,
-	/// The exponents for `c_lo` (needed for the phase 5 parity zerocheck on `c_lo_0`).
-	pub c_lo_exponents: S,
+	/// The exponents for `c_lo` (needed for the phase 5 lookup indices, parity zerocheck on
+	/// `c_lo_0`, and the raw per-bit output evaluations).
+	#[getset(skip)]
+	pub c_lo_exponents: &'a [Word],
 	/// Prodcheck prover for the `c_lo` exponentiation tree (leaf layer retained).
 	pub c_lo_prodcheck: ProdcheckProver<P>,
 	/// The root of the `c_lo` tree.
 	pub c_lo_root: FieldBuffer<P>,
+	/// The exponents for `c_hi` (needed for the phase 5 lookup indices and raw per-bit output
+	/// evaluations).
+	#[getset(skip)]
+	pub c_hi_exponents: &'a [Word],
 	/// Prodcheck prover for the `c_hi` exponentiation tree (leaf layer retained).
 	pub c_hi_prodcheck: ProdcheckProver<P>,
 	/// The root of the `c_hi` tree.
 	pub c_hi_root: FieldBuffer<P>,
-	/// The root of a `log_bits + 1` deep tree of the full product `c` (`c_lo_root * c_hi_root`).
-	pub c_root: FieldBuffer<P>,
-	#[getset(skip)]
-	pub _b_marker: PhantomData<B>,
+	/// The 2·N_LIMBS twisted power tables: `tables[s][i] = (G^{2^{ws}})^i`. Limb column `(t, l)`
+	/// is a gather from table `s(t, l)`; `tables[0]` is the shared table read by the Phase 5
+	/// logup* lookup.
+	pub tables: Vec<FieldBuffer<P>>,
 }
 
-impl<F, P, B, S> Witness<P, B, S>
+impl<'a, F, P> Witness<'a, P>
 where
 	F: BinaryField,
 	P: PackedField<Scalar = F>,
-	B: Bitwise,
-	S: AsRef<[B]> + Sync,
 {
 	/// Constructs a new integer multiplication witness from the statement.
-	///
-	/// For statement of size $2^\ell$ using $2^m$-wide integers, the upper bound on the
-	/// witness size is $8^{\ell+m}$ large field elements.
-	pub fn new(log_bits: usize, a: S, b: S, c_lo: S, c_hi: S) -> Result<Self, Error> {
+	pub fn new(
+		a: &'a [Word],
+		b: &'a [Word],
+		c_lo: &'a [Word],
+		c_hi: &'a [Word],
+	) -> Result<Self, Error> {
+		assert!(2 * WORD_SIZE_BITS <= F::N_BITS);
+
 		// Statement should be of pow-2 length.
-		let Some(n_vars) = strict_log_2(a.as_ref().len()) else {
+		let Some(n_vars) = strict_log_2(a.len()) else {
 			return Err(Error::ExponentsPowerOfTwoLengthRequired);
 		};
 
 		// All statement slices should be of same length.
-		if [&a, &b, &c_lo, &c_hi]
+		if [a, b, c_lo, c_hi]
 			.iter()
-			.any(|exponents| exponents.as_ref().len() != 1 << n_vars)
+			.any(|exponents| exponents.len() != 1 << n_vars)
 		{
 			return Err(Error::ExponentLengthMismatch);
 		}
 
+		// The 2·N_LIMBS twisted power tables: tables[s][i] = (G^{2^{ws}})^i. The `a` and `c_lo`
+		// limb columns read tables 0..N_LIMBS; the `c_hi` limb columns (base
+		// G^{2^{WORD_SIZE_BITS}}) read tables N_LIMBS..2·N_LIMBS. Table 0 is the shared logup*
+		// table.
+		let power_table_scope = tracing::debug_span!("Build power tables").entered();
 		let g = F::MULTIPLICATIVE_GENERATOR;
-		let g_c_hi = iterate(g, |g| g.square())
-			.nth(1 << log_bits)
-			.expect("infinite iterator");
+		let bases = iterate(g, |g| g.square())
+			.step_by(LIMB_BITS)
+			.take(2 * N_LIMBS)
+			.collect::<Vec<_>>();
+		let tables = bases
+			.into_par_iter()
+			.map(|base| power_table::<F, P>(LIMB_BITS, base))
+			.collect::<Vec<_>>();
+		drop(power_table_scope);
 
-		// Build the constant-base leaf layers and their prodcheck provers. Each prover's products
+		// Build the per-limb leaf layers and their prodcheck provers. Each prover's products
 		// layer is the corresponding tree root.
-		let a_leaves = constant_base_leaves(log_bits, g, &a);
-		let (a_prodcheck, a_root) = ProdcheckProver::new(log_bits, a_leaves);
+		let fixed_base_tree_scope =
+			tracing::debug_span!("Compute fixed-base prodcheck layers").entered();
+		let a_leaves = limb_leaves(&tables[..N_LIMBS], a);
+		let (a_prodcheck, a_root) = ProdcheckProver::new(LOG_N_LIMBS, a_leaves);
 
-		let c_lo_leaves = constant_base_leaves(log_bits, g, &c_lo);
-		let (c_lo_prodcheck, c_lo_root) = ProdcheckProver::new(log_bits, c_lo_leaves);
+		let c_lo_leaves = limb_leaves(&tables[..N_LIMBS], c_lo);
+		let (c_lo_prodcheck, c_lo_root) = ProdcheckProver::new(LOG_N_LIMBS, c_lo_leaves);
 
-		let c_hi_leaves = constant_base_leaves(log_bits, g_c_hi, &c_hi);
-		let (c_hi_prodcheck, c_hi_root) = ProdcheckProver::new(log_bits, c_hi_leaves);
+		let c_hi_leaves = limb_leaves(&tables[N_LIMBS..], c_hi);
+		let (c_hi_prodcheck, c_hi_root) = ProdcheckProver::new(LOG_N_LIMBS, c_hi_leaves);
+		drop(fixed_base_tree_scope);
 
 		// Compute b_leaves as concatenated leaves for prodcheck; the variable base is the `a` root.
-		let b_leaves = compute_b_leaves(log_bits, a_root.clone(), &b);
-
-		// Create the prodcheck prover; its products layer becomes b_root
-		let (b_prodcheck, b_root) = ProdcheckProver::new(log_bits, b_leaves.clone());
-
-		// The root of a `log_bits + 1` deep tree of the full product `c`.
-		let c_root = buffer_bivariate_product(&c_lo_root, &c_hi_root);
+		let variable_base_tree_scope =
+			tracing::debug_span!("Compute variable-base prodcheck layers").entered();
+		let b_leaves = compute_b_leaves(&a_root, b);
+		let (b_prodcheck, b_root) = ProdcheckProver::new(LOG_WORD_SIZE_BITS, b_leaves.clone());
+		drop(variable_base_tree_scope);
 
 		Ok(Self {
-			log_bits,
 			a_exponents: a,
 			a_prodcheck,
 			a_root,
@@ -133,45 +161,109 @@ where
 			c_lo_exponents: c_lo,
 			c_lo_prodcheck,
 			c_lo_root,
+			c_hi_exponents: c_hi,
 			c_hi_prodcheck,
 			c_hi_root,
-			c_root,
-			_b_marker: PhantomData,
+			tables,
 		})
 	}
 }
 
-/// Build the concatenated constant-base leaf layer for a GKR exponentiation tree.
+/// Number of packed columns filled as one independent group before chaining to the next block.
 ///
-/// The widest layer of the tree contains `2^log_bits` selected multilinears: the leaf for bit `b`
-/// has value `base^{2^b}` where the `b`-th bit of the corresponding exponent is set, and `1`
-/// otherwise.
-///
-/// The leaves are concatenated into one `(n_vars + log_bits)`-variate buffer with the node index in
-/// the high bits, in natural bit order: node position `p` carries the leaf for bit `p`. This
-/// matches the `b`-tree layout ([`compute_b_leaves`]). The prodcheck reduces on the highest node
-/// bit, so its first reduction (and the verifier's final GKR layer) pairs leaf `z` with leaf
-/// `z + 2^{log_bits-1}` — a strided pairing of bits `z` and `z + 2^{log_bits-1}`.
-fn constant_base_leaves<F, P, B, S>(log_bits: usize, base: F, exponents: &S) -> FieldBuffer<P>
+/// The power chain `base^i` is inherently serial; striding the fill into blocks of
+/// `2^LOG_STRIDE` independent packed multiplies exposes instruction-level parallelism so the
+/// multiplier pipeline stays busy. `4` keeps a block (16 packed elements) comfortably in registers.
+const LOG_STRIDE: usize = 4;
+
+/// The first `count` powers of `base` (`base^0 .. base^(count-1)`) plus the next power
+/// `base^count`.
+fn sequential_powers<F: Field>(count: usize, base: F) -> (Vec<F>, F) {
+	let mut scalars = Vec::with_capacity(count);
+	let mut row = F::ONE;
+	for _ in 0..count {
+		scalars.push(row);
+		row *= base;
+	}
+	(scalars, row)
+}
+
+/// Build the power table of `base` with `2^log_size` rows: row `i` holds `base^i`.
+pub fn power_table<F, P>(log_size: usize, base: F) -> FieldBuffer<P>
 where
 	F: Field,
 	P: PackedField<Scalar = F>,
-	B: Bitwise,
-	S: AsRef<[B]> + Sync,
 {
-	let bases = iterate(base, |g| g.square())
-		.take(1 << log_bits)
-		.collect::<Vec<_>>();
+	// The first block spans `2^log_block` scalars = `2^LOG_STRIDE` packed elements.
+	let log_block = P::LOG_WIDTH + LOG_STRIDE;
 
-	let n_vars = checked_log_2(exponents.as_ref().len());
-	let scalars = (0..1 << log_bits)
-		.flat_map(|bit| {
-			let leaf = two_valued_field_buffer::<F, P, S, B>(bit, exponents, [F::ONE, bases[bit]]);
-			leaf.iter_scalars().collect::<Vec<_>>()
+	// Small tables (at most one block) don't benefit from striding; build them sequentially. This
+	// also covers `log_size < P::LOG_WIDTH` (a single partially-filled packed element).
+	if log_size <= log_block {
+		let (scalars, _) = sequential_powers(1 << log_size, base);
+		return FieldBuffer::<P>::from_values(&scalars);
+	}
+
+	// Build the first block's `2^log_block` sequential powers, packed into `2^LOG_STRIDE` elements;
+	// `incr = base^(2^log_block)` is the per-block increment.
+	let (block_scalars, incr_scalar) = sequential_powers(1 << log_block, base);
+	let incr = P::broadcast(incr_scalar);
+
+	let block_len = 1 << LOG_STRIDE; // packed elements per block
+	let packed_len = 1 << (log_size - P::LOG_WIDTH);
+	let mut table = Vec::<P>::with_capacity(packed_len);
+	table.extend(
+		block_scalars
+			.chunks(P::WIDTH)
+			.map(|chunk| P::from_scalars(chunk.iter().copied())),
+	);
+	table.resize(packed_len, P::zero());
+
+	// Fill each block from the previous one; the `block_len` multiplies within a block are
+	// independent, so only the block-to-block step carries a dependency.
+	let mut blocks = table.chunks_mut(block_len);
+	let mut prev = blocks
+		.next()
+		.expect("log_size > log_block, so packed_len > block_len");
+	for cur in blocks {
+		for (dst, &src) in cur.iter_mut().zip(prev.iter()) {
+			*dst = src * incr;
+		}
+		prev = cur;
+	}
+
+	FieldBuffer::new(log_size, table.into_boxed_slice())
+}
+
+/// Extract limb `l` of an exponent word as a table row index.
+pub(super) const fn limb_index(word: Word, limb: usize) -> usize {
+	((word.0 >> (limb * LIMB_BITS)) & ((1 << LIMB_BITS) - 1)) as usize
+}
+
+/// Build the concatenated per-limb leaf columns for a constant-base GKR exponentiation tree.
+///
+/// Column `l` has entries `tables[l][limb_l(e)]` — the limb-`l` exponentiation of the
+/// corresponding word. The columns are concatenated into one `(n_vars + LOG_N_LIMBS)`-variate
+/// buffer with the limb index in the high bits, so the prodcheck's node reductions pair column `z`
+/// with column `z + N_LIMBS/2`.
+fn limb_leaves<F, P>(tables: &[FieldBuffer<P>], exponents: &[Word]) -> FieldBuffer<P>
+where
+	F: Field,
+	P: PackedField<Scalar = F>,
+{
+	assert_eq!(tables.len(), N_LIMBS);
+
+	let n_vars = checked_log_2(exponents.len());
+	let scalars = (0..N_LIMBS)
+		.flat_map(|limb| {
+			let table = &tables[limb];
+			exponents
+				.iter()
+				.map(move |&word| table.get(limb_index(word, limb)))
 		})
 		.collect::<Vec<_>>();
 
-	debug_assert_eq!(scalars.len(), 1 << (n_vars + log_bits));
+	debug_assert_eq!(scalars.len(), 1 << (n_vars + LOG_N_LIMBS));
 	FieldBuffer::<P>::from_values(&scalars)
 }
 
@@ -179,34 +271,30 @@ where
 ///
 /// Each leaf `L_z` contains: if bit z of `exponents[i]` is set then `bases[i]^{2^z}` else 1
 /// The leaves are concatenated: `[L_0, L_1, ..., L_{2^k-1}]`
-fn compute_b_leaves<F, P, B, S>(
-	log_bits: usize,
-	bases: FieldBuffer<P>,
-	exponents: &S,
-) -> FieldBuffer<P>
+#[doc(hidden)] // exposed for benchmarking (`benches/intmul.rs`), not a stable API
+pub fn compute_b_leaves<F, P>(bases: &FieldBuffer<P>, exponents: &[Word]) -> FieldBuffer<P>
 where
 	F: Field,
 	P: PackedField<Scalar = F>,
-	B: Bitwise,
-	S: AsRef<[B]> + Sync,
 {
 	let n_vars = bases.log_len();
 
 	if P::LOG_WIDTH <= n_vars {
 		// Parallel optimized path
-		return compute_b_leaves_parallel(log_bits, &bases, exponents);
+		return compute_b_leaves_parallel(bases, exponents);
 	}
 
 	// Fallback: bases is too small to parallelize (n_vars < P::LOG_WIDTH)
-	let mut out = FieldBuffer::zeros(n_vars + log_bits);
+	let mut out = FieldBuffer::zeros(n_vars + LOG_WORD_SIZE_BITS);
 	let n_elems = 1 << n_vars;
 
-	let one_bit = B::from(1u8);
-	for (i, (mut base, &exp)) in iter::zip(bases.iter_scalars(), exponents.as_ref()).enumerate() {
-		for z in 0..1 << log_bits {
-			let bit = (exp >> z) & one_bit == one_bit;
-
-			out.set(z * n_elems + i, if bit { base } else { F::ONE });
+	for (i, (mut base, &exp)) in iter::zip(bases.iter_scalars(), exponents).enumerate() {
+		for z in 0..WORD_SIZE_BITS {
+			// Branchless select of `base` when bit `z` is set, else `F::ONE`: on the selected lane
+			// `mask` is all-ones so `select` keeps `base - 1` and the `+ 1` restores `base`; on the
+			// unselected lane `select` yields `0` and the `+ 1` gives `F::ONE`.
+			let mask = F::make_mask(iter::once(exp.extract_bit(z)));
+			out.set(z * n_elems + i, F::ONE + (base - F::ONE).select(&mask));
 
 			base = base.square();
 		}
@@ -216,20 +304,14 @@ where
 }
 
 /// Parallel implementation of compute_b_leaves for when bases is large enough to parallelize.
-fn compute_b_leaves_parallel<F, P, B, S>(
-	log_bits: usize,
-	bases: &FieldBuffer<P>,
-	exponents: &S,
-) -> FieldBuffer<P>
+fn compute_b_leaves_parallel<F, P>(bases: &FieldBuffer<P>, exponents: &[Word]) -> FieldBuffer<P>
 where
 	F: Field,
 	P: PackedField<Scalar = F>,
-	B: Bitwise,
-	S: AsRef<[B]> + Sync,
 {
 	let n_vars = bases.log_len();
 	let n_packed = bases.as_ref().len();
-	let height = 1 << log_bits;
+	let height = WORD_SIZE_BITS;
 	let total = n_packed * height;
 
 	let mut out_vec: Vec<P> = Vec::with_capacity(total);
@@ -240,23 +322,20 @@ where
 		let mut strided = StridedArray2DViewMut::without_stride(spare, height, n_packed)
 			.expect("dimensions match capacity");
 
-		let one_bit = B::from(1u8);
-
-		(strided.par_iter_cols(), bases.as_ref(), exponents.as_ref().par_chunks(P::WIDTH))
+		let ones = P::broadcast(F::ONE);
+		(strided.par_iter_cols(), bases.as_ref(), exponents.par_chunks(P::WIDTH))
 			.into_par_iter()
 			.for_each(|(mut col, packed_base, exp_chunk)| {
 				// Keep base as packed element for efficient squaring
 				let mut packed_base = *packed_base;
 
 				for z in 0..height {
-					// Decompose to scalars, apply bit selection, recompose
-					// TODO: Optimize with bit-masking for selection
-					let scalars = packed_base.iter().zip(exp_chunk).map(|(base, &exp)| {
-						let bit = (exp >> z) & one_bit == one_bit;
-						if bit { base } else { F::ONE }
-					});
-
-					col[z].write(P::from_scalars(scalars));
+					// Branchless select, per lane, of `base` when bit `z` of the lane's exponent is
+					// set, else `F::ONE`. On selected lanes `mask` is all-ones so `select` keeps
+					// `base - 1` and the `+ 1` restores `base`; on unselected lanes `select` yields
+					// `0` and the `+ 1` gives `F::ONE`.
+					let mask = P::make_mask(exp_chunk.iter().map(|&exp| exp.extract_bit(z)));
+					col[z].write(ones + (packed_base - ones).select(&mask));
 
 					// Square packed base for next iteration
 					packed_base = packed_base.square();
@@ -267,7 +346,7 @@ where
 	// SAFETY: All elements initialized in the parallel loop above
 	unsafe { out_vec.set_len(total) };
 
-	FieldBuffer::new(n_vars + log_bits, out_vec.into_boxed_slice())
+	FieldBuffer::new(n_vars + LOG_WORD_SIZE_BITS, out_vec.into_boxed_slice())
 }
 
 /// Compute the per-vertex bivariate product of two equally sized field buffers.
@@ -285,36 +364,29 @@ pub fn buffer_bivariate_product<P: PackedField, Data: Deref<Target = [P]>>(
 
 /// Constructs a field buffer with values selected from `elements` based on the bit values
 /// of `exponents`.
-pub fn two_valued_field_buffer<F, P, S, B>(
+pub fn two_valued_field_buffer<F, P>(
 	bit_offset: usize,
-	exponents: &S,
+	exponents: &[Word],
 	elements: [F; 2],
 ) -> FieldBuffer<P>
 where
 	F: Field,
 	P: PackedField<Scalar = F>,
-	S: AsRef<[B]> + Sync,
-	B: Bitwise,
 {
-	let n_vars = checked_log_2(exponents.as_ref().len());
+	let n_vars = checked_log_2(exponents.len());
 	let p_width = P::WIDTH.min(1 << n_vars);
-	let bits = BitSelector::new(bit_offset, &exponents);
 	let values = (0..1 << n_vars.saturating_sub(P::LOG_WIDTH))
 		.map(|i| {
 			let scalars = (0..p_width).map(|j| {
-				// The following code is equivalent to
-				// ```
-				// if bits.get(i << P::LOG_WIDTH | j) {
-				// 	elements[1]
-				// } else {
-				// 	elements[0]
-				// }
-				// ```
+				let index = i << P::LOG_WIDTH | j;
+				// Select `elements[1]` if bit `bit_offset` of `exponents[index]` is set, else
+				// `elements[0]`.
 				unsafe {
 					// Safety:
-					// - `i << P::LOG_WIDTH | j` is guaranteed to be in-bounds
-					// - elements has two values
-					*elements.get_unchecked(bits.get_unchecked(i << P::LOG_WIDTH | j) as usize)
+					// - `index` is guaranteed to be in-bounds
+					// - `elements` has two values
+					let is_set = exponents.get_unchecked(index).extract_bit(bit_offset);
+					*elements.get_unchecked(is_set as usize)
 				}
 			});
 			P::from_scalars(scalars)
@@ -332,35 +404,33 @@ mod tests {
 
 	type P = Packed128b;
 
-	const LOG_BITS: usize = 6;
-
-	fn check_consistency<P: PackedField, B: Bitwise, S: AsRef<[B]> + Sync>(
-		witness: &Witness<P, B, S>,
-	) {
-		let b_root = witness.b_root();
-		let c_root = witness.c_root();
-		assert_eq!(b_root, c_root);
+	fn check_consistency<P: PackedField>(witness: &Witness<'_, P>) {
+		// The variable-base `b`-exponent tree root must equal the full product `c` root
+		// (`c_lo_root * c_hi_root`); this equality is what lets the prover reuse `b_root` in place
+		// of a separately stored `c_root`.
+		let c_root = buffer_bivariate_product(witness.c_lo_root(), witness.c_hi_root());
+		assert_eq!(witness.b_root(), &c_root);
 	}
 
 	#[test]
 	fn test_forwards() {
-		let a: u64 = 2;
-		let b: u64 = 3;
-		let c_lo: u64 = 6; // 2*3 = 6
-		let c_hi: u64 = 0; // no high bits
+		let a = [Word::from_u64(2)];
+		let b = [Word::from_u64(3)];
+		let c_lo = [Word::from_u64(6)]; // 2*3 = 6
+		let c_hi = [Word::from_u64(0)]; // no high bits
 
-		let witness = Witness::<P, _, [u64; 1]>::new(LOG_BITS, [a], [b], [c_lo], [c_hi]).unwrap();
+		let witness = Witness::<P>::new(&a, &b, &c_lo, &c_hi).unwrap();
 		check_consistency(&witness);
 	}
 
 	#[test]
 	fn test_forwards_larger() {
-		let a: u64 = 1 << 32;
-		let b: u64 = 1 << 33;
-		let c_lo: u64 = 0;
-		let c_hi: u64 = 2; // 2^32 * 2^33 = 2^65, which is 2 in the high 64 bits
+		let a = [Word::from_u64(1 << 32)];
+		let b = [Word::from_u64(1 << 33)];
+		let c_lo = [Word::from_u64(0)];
+		let c_hi = [Word::from_u64(2)]; // 2^32 * 2^33 = 2^65, which is 2 in the high 64 bits
 
-		let witness = Witness::<P, _, [u64; 1]>::new(LOG_BITS, [a], [b], [c_lo], [c_hi]).unwrap();
+		let witness = Witness::<P>::new(&a, &b, &c_lo, &c_hi).unwrap();
 		check_consistency(&witness);
 	}
 
@@ -384,13 +454,80 @@ mod tests {
 			let c_lo_i = full_result as u64;
 			let c_hi_i = (full_result >> 64) as u64;
 
-			a.push(a_i);
-			b.push(b_i);
-			c_lo.push(c_lo_i);
-			c_hi.push(c_hi_i);
+			a.push(Word::from_u64(a_i));
+			b.push(Word::from_u64(b_i));
+			c_lo.push(Word::from_u64(c_lo_i));
+			c_hi.push(Word::from_u64(c_hi_i));
 		}
 
-		let witness = Witness::<P, _, _>::new(LOG_BITS, a, b, c_lo, c_hi).unwrap();
+		let witness = Witness::<P>::new(&a, &b, &c_lo, &c_hi).unwrap();
 		check_consistency(&witness);
+	}
+	/// Directly checks `compute_b_leaves` against its specification — leaf `z` holds
+	/// `bases[i]^(2^z)` where bit `z` of `exponents[i]` is set, else `F::ONE` — over both the
+	/// parallel path (`n_vars >= P::LOG_WIDTH`) and the scalar fallback (`n_vars < P::LOG_WIDTH`).
+	#[test]
+	fn compute_b_leaves_matches_spec() {
+		use binius_field::{BinaryField128bGhash, Random, arithmetic_traits::Square};
+		use rand::prelude::*;
+
+		type F = BinaryField128bGhash;
+
+		let mut rng = StdRng::seed_from_u64(1);
+		// `Packed128b` has `LOG_WIDTH == 2`: `n_vars = 0` exercises the scalar fallback and
+		// `n_vars = 4` the parallel path.
+		for n_vars in [0usize, 4] {
+			let n_elems = 1 << n_vars;
+			let base_scalars = (0..n_elems)
+				.map(|_| F::random(&mut rng))
+				.collect::<Vec<_>>();
+			let bases = FieldBuffer::<P>::from_values(&base_scalars);
+			let exponents = (0..n_elems)
+				.map(|_| Word::from_u64(rng.random()))
+				.collect::<Vec<_>>();
+
+			let leaves = compute_b_leaves::<F, P>(&bases, &exponents);
+
+			for (i, &base0) in base_scalars.iter().enumerate() {
+				let mut base = base0;
+				for z in 0..WORD_SIZE_BITS {
+					let expected = if exponents[i].extract_bit(z) {
+						base
+					} else {
+						F::ONE
+					};
+					assert_eq!(
+						leaves.get(z * n_elems + i),
+						expected,
+						"mismatch at n_vars={n_vars}, i={i}, z={z}"
+					);
+					base = base.square();
+				}
+			}
+		}
+	}
+
+	/// Checks `power_table` against a sequential reference (`row i == base^i`) across both the
+	/// small sequential fallback (`log_size <= P::LOG_WIDTH + LOG_STRIDE`) and the strided packed
+	/// path.
+	#[test]
+	fn power_table_matches_sequential() {
+		use binius_field::{BinaryField128bGhash, Random};
+		use rand::prelude::*;
+
+		type F = BinaryField128bGhash;
+
+		let mut rng = StdRng::seed_from_u64(2);
+		let base = F::random(&mut rng);
+		// `Packed128b` has `LOG_WIDTH == 2`, so `log_block == 6`: sizes up to 6 take the sequential
+		// fallback; 7 and 10 (multiple blocks) exercise the strided path.
+		for log_size in [0usize, 3, 6, 7, 10] {
+			let table = power_table::<F, P>(log_size, base);
+			let mut expected = F::ONE;
+			for i in 0..1usize << log_size {
+				assert_eq!(table.get(i), expected, "mismatch at log_size={log_size}, i={i}");
+				expected *= base;
+			}
+		}
 	}
 }

@@ -1,16 +1,14 @@
 // Copyright 2025 Irreducible Inc.
 
 use binius_core::word::Word;
-use binius_field::{AESTowerField8b, BinaryField, Field, PackedField, util::powers};
+use binius_field::{BinaryField, Field, PackedField, util::powers};
+use binius_ip::sumcheck::SumcheckOutput;
 use binius_ip_prover::channel::IPProverChannel;
 use binius_math::{
-	FieldBuffer, inner_product::inner_product, multilinear::eq::eq_ind_partial_eval,
+	BinarySubspace, FieldBuffer, inner_product::inner_product, multilinear::eq::eq_ind_partial_eval,
 };
-use binius_verifier::protocols::sumcheck::SumcheckOutput;
 
-use super::{
-	error::Error, key_collection::KeyCollection, phase_1::prove_phase_1, phase_2::prove_phase_2,
-};
+use super::{key_collection::KeyCollection, phase_1::prove_phase_1, phase_2::prove_phase_2};
 
 /// Holds the prover data for an operator.
 ///
@@ -99,10 +97,11 @@ pub fn prove<F, P, Channel>(
 	words: &[Word],
 	bitand_data: OperatorData<F>,
 	intmul_data: OperatorData<F>,
+	domain_subspace: &BinarySubspace<F>,
 	channel: &mut Channel,
-) -> Result<SumcheckOutput<F>, Error>
+) -> SumcheckOutput<F>
 where
-	F: BinaryField + From<AESTowerField8b>,
+	F: BinaryField,
 	P: PackedField<Scalar = F>,
 	Channel: IPProverChannel<F>,
 {
@@ -124,8 +123,9 @@ where
 		words,
 		&prepared_bitand_data,
 		&prepared_intmul_data,
+		domain_subspace,
 		channel,
-	)?;
+	);
 
 	// Prove the second phase, receiving a `SumcheckOutput`
 	// with challenges `r_y` and eval the evaluation of
@@ -136,10 +136,11 @@ where
 		words,
 		&prepared_bitand_data,
 		&prepared_intmul_data,
+		domain_subspace,
 		phase_1_output,
 		channel,
-	)?;
+	);
 
 	// Return evaluation claim on the witness.
-	Ok(SumcheckOutput { challenges, eval })
+	SumcheckOutput { challenges, eval }
 }

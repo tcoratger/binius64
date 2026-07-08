@@ -137,7 +137,6 @@ impl<'a> Interpreter<'a> {
 				0x21 => self.exec_iadd_cin_cout(ctx),
 				0x23 => self.exec_isub_bin_bout(ctx),
 				0x30 => self.exec_imul(ctx),
-				0x31 => self.exec_smul(ctx),
 
 				// 32-bit operations
 				0x40 => self.exec_iadd32_cin_cout(ctx),
@@ -301,16 +300,6 @@ impl<'a> Interpreter<'a> {
 		let src1 = self.read_reg();
 		let src2 = self.read_reg();
 		let (hi, lo) = self.load(ctx, src1).imul(self.load(ctx, src2));
-		self.store(ctx, dst_hi, hi);
-		self.store(ctx, dst_lo, lo);
-	}
-
-	fn exec_smul(&mut self, ctx: &mut ExecutionContext<'_>) {
-		let dst_hi = self.read_reg();
-		let dst_lo = self.read_reg();
-		let src1 = self.read_reg();
-		let src2 = self.read_reg();
-		let (hi, lo) = self.load(ctx, src1).smul(self.load(ctx, src2));
 		self.store(ctx, dst_hi, hi);
 		self.store(ctx, dst_lo, lo);
 	}
@@ -530,7 +519,7 @@ impl<'a> Interpreter<'a> {
 	}
 
 	fn store(&self, ctx: &mut ExecutionContext<'_>, reg: u32, value: Word) {
-		ctx.value_vec.set(reg as usize, value);
+		ctx.value_vec[ValueIndex(reg)] = value;
 	}
 
 	// Bytecode reading helpers

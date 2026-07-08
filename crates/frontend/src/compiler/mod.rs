@@ -208,13 +208,15 @@ impl CircuitBuilder {
 	///
 	/// Must be called only once.
 	pub fn build(&self) -> Circuit {
-		let all_one = self.add_constant(Word::ALL_ONE);
 		let shared = self.shared.borrow_mut().take();
 
 		let Some(shared) = shared else {
 			panic!("CircuitBuilder::build called twice");
 		};
 		let mut graph = shared.graph;
+
+		// The all-one wire is seeded as the first constant when the graph is constructed.
+		let all_one = graph.all_one;
 
 		graph.validate(&shared.hint_registry);
 
@@ -305,7 +307,7 @@ impl CircuitBuilder {
 			value_vec_alloc.into_assignment()
 		};
 
-		// Invariant: the all-one constant injected above lands at the front of the segment.
+		// Invariant: the all-one constant seeded at graph construction is the first constant.
 		// Downstream consumers reference it by the fixed index 0.
 		debug_assert_eq!(wire_mapping[all_one], binius_core::ValueIndex(0));
 		debug_assert_eq!(constants.first(), Some(&Word::ALL_ONE));

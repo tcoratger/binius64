@@ -53,7 +53,7 @@ impl Alloc {
 		self.w_scratch.push(wire);
 	}
 
-	pub fn into_assignment(mut self) -> Assignment {
+	pub fn into_assignment(self) -> Assignment {
 		// `ValueVec` expects the wires to be in a certain order. Specifically:
 		//
 		// 1. const
@@ -72,16 +72,9 @@ impl Alloc {
 		let n_internal = self.w_internal.len();
 		let n_scratch = self.w_scratch.len();
 
-		// Order the constant section so the all-one word is first, then all others ascending.
-		//
-		// Every circuit build injects an all-one constant.
-		// Downstream code reads it at the fixed index 0 instead of threading its wire.
-		//
-		// Sort key `(value != ALL_ONE, value)`:
-		// - The first component is `false` (sorts first) only for the all-one word.
-		// - It is uniformly `true` when no all-one constant is present, leaving plain ascending.
-		self.w_const
-			.sort_by_key(|&(_, value)| (value != Word::ALL_ONE, value));
+		// Constants keep the order in which they were added, which is wire-creation order.
+		// The gate graph seeds the all-one constant first (see `GateGraph::new`).
+		// So it is the first constant here and lands at value index 0.
 
 		// First, allocate the indices for the public section of the value vec. The public section
 		// consists of constant wires followed by inout wires.
@@ -160,7 +153,7 @@ mod tests {
 
 		let mut alloc = Alloc::new();
 
-		// Add wires in mixed order to test sorting
+		// Add wires in a deliberately mixed order to test section ordering.
 		let witness1 = Wire::from_u32(0);
 		let const1 = Wire::from_u32(1);
 		let internal1 = Wire::from_u32(2);
@@ -189,12 +182,12 @@ mod tests {
 		// Build the assignment
 		let assignment = alloc.into_assignment();
 
-		// Verify constants come first and are sorted by value
+		// Constants come first, in the order they were added.
 		assert_eq!(assignment.wire_mapping[const1], ValueIndex(0));
 		assert_eq!(assignment.wire_mapping[const2], ValueIndex(1));
 		assert_eq!(assignment.wire_mapping[const3], ValueIndex(2));
 
-		// Verify the constants vector is sorted by value
+		// The constants vector preserves insertion order.
 		assert_eq!(assignment.constants, vec![Word(42), Word(100), Word(200)]);
 
 		// Inout wires should come after constants
@@ -233,35 +226,6 @@ mod tests {
 		assert_eq!(assignment.value_vec_layout.offset_witness, witness1_idx.0 as usize);
 		// The witness segment is padded from 4 words up to the public segment length (8).
 		assert_eq!(assignment.value_vec_layout.n_hidden_words, 8);
-	}
-
-	#[test]
-	fn test_all_one_is_first_constant() {
-		// Invariant: the all-one word occupies index 0 of the constants segment.
-		//
-		// The all-one word is u64::MAX, so a plain ascending sort would place it last.
-		// The allocator must override that and pin it to the front.
-		let mut alloc = Alloc::new();
-
-		// Fixture state: three constants added so the all-one word is neither first nor last.
-		let smaller = Wire::from_u32(0);
-		let all_one = Wire::from_u32(1);
-		let zero = Wire::from_u32(2);
-		alloc.add_constant(smaller, Word(42));
-		alloc.add_constant(all_one, Word::ALL_ONE);
-		alloc.add_constant(zero, Word::ZERO);
-
-		let assignment = alloc.into_assignment();
-
-		// Expected order: all-one leads, remaining constants ascending.
-		//
-		//     input values:  [ 42, ALL_ONE, 0 ]
-		//     sorted segment: [ ALL_ONE, 0, 42 ]
-		//                        idx 0   1   2
-		assert_eq!(assignment.wire_mapping[all_one], ValueIndex(0));
-		assert_eq!(assignment.wire_mapping[zero], ValueIndex(1));
-		assert_eq!(assignment.wire_mapping[smaller], ValueIndex(2));
-		assert_eq!(assignment.constants, vec![Word::ALL_ONE, Word::ZERO, Word(42)]);
 	}
 
 	#[test]

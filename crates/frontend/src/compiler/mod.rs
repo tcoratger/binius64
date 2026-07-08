@@ -304,6 +304,12 @@ impl CircuitBuilder {
 			}
 			value_vec_alloc.into_assignment()
 		};
+
+		// Invariant: the all-one constant injected above lands at the front of the segment.
+		// Downstream consumers reference it by the fixed index 0.
+		debug_assert_eq!(wire_mapping[all_one], binius_core::ValueIndex(0));
+		debug_assert_eq!(constants.first(), Some(&Word::ALL_ONE));
+
 		let (mut and_constraints, mut mul_constraints) = builder.build(&wire_mapping, all_one);
 
 		// Filter zero constant terms from all operands. Any shift of Word::ZERO is zero, so

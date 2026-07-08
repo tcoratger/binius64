@@ -1,4 +1,5 @@
 // Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 
 //! Circuit construction frontend for Binius64.
 //!
@@ -26,6 +27,7 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 
 mod compiler;
+pub mod ops;
 pub mod stat;
 
 pub mod util;
@@ -33,6 +35,7 @@ pub mod util;
 pub use compiler::{
 	CircuitBuilder, Wire,
 	circuit::{Circuit, PopulateError, WitnessFiller},
+	eval_form::BatchPopulateError,
 	hints::{self, Hint},
 };
 pub use stat::CircuitStat;

@@ -1,4 +1,5 @@
 // Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
 use binius_utils::serialization::{DeserializeBytes, SerializationError, SerializeBytes};
 use bytes::{Buf, BufMut};
 
@@ -30,7 +31,7 @@ pub struct ConstraintSystem {
 
 impl ConstraintSystem {
 	/// Serialization format version for compatibility checking
-	pub const SERIALIZATION_VERSION: u32 = 2;
+	pub const SERIALIZATION_VERSION: u32 = 3;
 }
 
 impl ConstraintSystem {
@@ -95,12 +96,15 @@ impl ConstraintSystem {
 						operand_name,
 					});
 				}
-				if term.amount >= 64 {
+				// Half-word (*32) variants cap at 32, full-width at 64.
+				let max_amount = term.shift_variant.max_amount();
+				if usize::from(term.amount) >= max_amount {
 					return Err(ConstraintSystemError::ShiftAmountTooLarge {
 						constraint_type,
 						constraint_index,
 						operand_name,
 						shift_amount: term.amount as usize,
+						max_amount,
 					});
 				}
 				// Check if the value index is out of bounds.
@@ -110,7 +114,7 @@ impl ConstraintSystem {
 						constraint_index,
 						operand_name,
 						value_index: term.value_index.0,
-						total_len: value_vec_layout.committed_total_len,
+						total_len: value_vec_layout.combined_len(),
 					});
 				}
 				// No value should refer to padding.
@@ -175,7 +179,7 @@ impl ConstraintSystem {
 
 	/// The total length of the [`ValueVec`] expected by this constraint system.
 	pub const fn value_vec_len(&self) -> usize {
-		self.value_vec_layout.committed_total_len
+		self.value_vec_layout.combined_len()
 	}
 
 	/// Create a new [`ValueVec`] with the size expected by this constraint system.
@@ -244,9 +248,9 @@ mod tests {
 			n_inout: 2,
 			n_witness: 10,
 			n_internal: 3,
-			offset_inout: 4,         // Must be power of 2 and >= n_const
-			offset_witness: 8,       // Must be power of 2 and >= offset_inout + n_inout
-			committed_total_len: 16, // Must be power of 2 and >= offset_witness + n_witness
+			offset_inout: 4,   // Must be power of 2 and >= n_const
+			offset_witness: 8, // Must be power of 2 and >= offset_inout + n_inout
+			n_hidden_words: 8, // Must be power of 2 and >= offset_witness + n_witness
 			n_scratch: 0,
 		};
 
@@ -283,7 +287,7 @@ mod tests {
 		let deserialized = ConstraintSystem::deserialize(&mut buf.as_slice()).unwrap();
 
 		// Check version
-		assert_eq!(ConstraintSystem::SERIALIZATION_VERSION, 2);
+		assert_eq!(ConstraintSystem::SERIALIZATION_VERSION, 3);
 
 		// Check value_vec_layout
 		assert_eq!(original.value_vec_layout, deserialized.value_vec_layout);
@@ -327,7 +331,7 @@ mod tests {
 			n_internal: 3,
 			offset_inout: 8,
 			offset_witness: 16,
-			committed_total_len: 32,
+			n_hidden_words: 16,
 			n_scratch: 0,
 		};
 
@@ -385,7 +389,7 @@ mod tests {
 		constraint_system.serialize(&mut buf).unwrap();
 
 		// Write to reference file.
-		let test_data_path = std::path::Path::new("test_data/constraint_system_v2.bin");
+		let test_data_path = std::path::Path::new("test_data/constraint_system_v3.bin");
 
 		// Create directory if it doesn't exist
 		if let Some(parent) = test_data_path.parent() {
@@ -402,9 +406,9 @@ mod tests {
 	/// This test will fail if breaking changes are made without incrementing the version.
 	#[test]
 	fn test_deserialize_from_reference_binary_file() {
-		// We now have v2 format with n_scratch field
-		// The v1 file is no longer compatible, so we test with v2
-		let binary_data = include_bytes!("../../test_data/constraint_system_v2.bin");
+		// The v3 format counts `n_hidden_words` without the public segment; older files are
+		// no longer compatible.
+		let binary_data = include_bytes!("../../test_data/constraint_system_v3.bin");
 
 		let deserialized = ConstraintSystem::deserialize(&mut binary_data.as_slice()).unwrap();
 
@@ -414,7 +418,7 @@ mod tests {
 		assert_eq!(deserialized.value_vec_layout.n_internal, 3);
 		assert_eq!(deserialized.value_vec_layout.offset_inout, 4);
 		assert_eq!(deserialized.value_vec_layout.offset_witness, 8);
-		assert_eq!(deserialized.value_vec_layout.committed_total_len, 16);
+		assert_eq!(deserialized.value_vec_layout.n_hidden_words, 8);
 		assert_eq!(deserialized.value_vec_layout.n_scratch, 0);
 
 		assert_eq!(deserialized.constants.len(), 3);
@@ -429,7 +433,7 @@ mod tests {
 		// This is implicitly checked during deserialization, but we can also verify
 		// the file starts with the correct version bytes
 		let version_bytes = &binary_data[0..4]; // First 4 bytes should be version
-		let expected_version_bytes = 2u32.to_le_bytes(); // Version 2 in little-endian
+		let expected_version_bytes = 3u32.to_le_bytes(); // Version 3 in little-endian
 		assert_eq!(
 			version_bytes, expected_version_bytes,
 			"Binary file version mismatch. If you made breaking changes, increment ConstraintSystem::SERIALIZATION_VERSION"
@@ -447,7 +451,7 @@ mod tests {
 				n_internal: 2,
 				offset_inout: 4,
 				offset_witness: 8,
-				committed_total_len: 16,
+				n_hidden_words: 8,
 				n_scratch: 0,
 			},
 			vec![],
@@ -485,7 +489,7 @@ mod tests {
 				n_internal: 4,
 				offset_inout: 2,
 				offset_witness: 4,
-				committed_total_len: 16,
+				n_hidden_words: 12,
 				n_scratch: 0,
 			},
 			vec![],
@@ -525,7 +529,7 @@ mod tests {
 				n_internal: 2,
 				offset_inout: 4,
 				offset_witness: 8,
-				committed_total_len: 16,
+				n_hidden_words: 8,
 				n_scratch: 0,
 			},
 			vec![],
@@ -570,7 +574,7 @@ mod tests {
 				n_internal: 4,
 				offset_inout: 2,
 				offset_witness: 4,
-				committed_total_len: 16,
+				n_hidden_words: 12,
 				n_scratch: 0,
 			},
 			vec![],
@@ -619,7 +623,7 @@ mod tests {
 				n_internal: 2,
 				offset_inout: 4,
 				offset_witness: 8,
-				committed_total_len: 16,
+				n_hidden_words: 8,
 				n_scratch: 0,
 			},
 			vec![],
@@ -650,6 +654,54 @@ mod tests {
 	}
 
 	#[test]
+	fn test_validate_rejects_half_word_shift_amount_out_of_range() {
+		let mut cs = ConstraintSystem::new(
+			vec![Word::from_u64(1)],
+			ValueVecLayout {
+				n_const: 1,
+				n_inout: 1,
+				n_witness: 2,
+				n_internal: 2,
+				offset_inout: 4,
+				offset_witness: 8,
+				n_hidden_words: 8,
+				n_scratch: 0,
+			},
+			vec![],
+			vec![],
+		);
+
+		// A half-word (*32) shift may only use amounts < 32.
+		// 32 is out of range even though it is below the full-width bound of 64.
+		cs.add_and_constraint(AndConstraint::abc(
+			vec![ShiftedValueIndex {
+				value_index: ValueIndex(0),
+				shift_variant: ShiftVariant::Sll32,
+				amount: 32,
+			}],
+			vec![ShiftedValueIndex::plain(ValueIndex(8))],
+			vec![ShiftedValueIndex::plain(ValueIndex(8))],
+		));
+
+		match cs.validate_and_prepare().unwrap_err() {
+			ConstraintSystemError::ShiftAmountTooLarge {
+				constraint_type,
+				constraint_index,
+				operand_name,
+				shift_amount,
+				max_amount,
+			} => {
+				assert_eq!(constraint_type, "and");
+				assert_eq!(constraint_index, 0);
+				assert_eq!(operand_name, "a");
+				assert_eq!(shift_amount, 32);
+				assert_eq!(max_amount, 32);
+			}
+			other => panic!("Expected ShiftAmountTooLarge, got: {:?}", other),
+		}
+	}
+
+	#[test]
 	fn test_roundtrip_cs_and_witnesses_reconstruct_valuevec_with_scratch() {
 		// Layout with non-zero scratch. Public = 8, total committed = 16, scratch = 5
 		let layout = ValueVecLayout {
@@ -659,7 +711,7 @@ mod tests {
 			n_internal: 3,
 			offset_inout: 4,   // >= n_const and power of two
 			offset_witness: 8, // >= offset_inout + n_inout and power of two
-			committed_total_len: 16,
+			n_hidden_words: 8,
 			n_scratch: 5, // non-zero scratch
 		};
 
@@ -668,7 +720,7 @@ mod tests {
 
 		// Build a ValueVec and fill both committed and scratch with non-zero data
 		let mut values = cs.new_value_vec();
-		let full_len = layout.committed_total_len + layout.n_scratch;
+		let full_len = layout.combined_len() + layout.n_scratch;
 		for i in 0..full_len {
 			// Deterministic pattern
 			let val = Word::from_u64(0xA5A5_5A5A ^ (i as u64 * 0x9E37_79B9));
@@ -702,7 +754,7 @@ mod tests {
 		assert_eq!(reconstructed.combined_witness(), values.combined_witness());
 
 		// Scratch is not serialized; reconstructed scratch should be zero-filled
-		let scratch_start = layout.committed_total_len;
+		let scratch_start = layout.combined_len();
 		let scratch_end = scratch_start + layout.n_scratch;
 		for i in scratch_start..scratch_end {
 			assert_eq!(

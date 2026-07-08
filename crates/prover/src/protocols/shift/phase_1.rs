@@ -4,13 +4,13 @@
 use std::{iter, ops::Range};
 
 use binius_core::word::Word;
-use binius_field::{AESTowerField8b, BinaryField, Field, PackedField};
+use binius_field::{BinaryField, Field, PackedField};
 use binius_ip::sumcheck::{SumcheckOutput, common::RoundCoeffs};
 use binius_ip_prover::{
 	channel::IPProverChannel,
 	sumcheck::{bivariate_product::BivariateProductSumcheckProver, common::SumcheckProver},
 };
-use binius_math::{FieldBuffer, inner_product::inner_product_buffers};
+use binius_math::{BinarySubspace, FieldBuffer, inner_product::inner_product_buffers};
 use binius_utils::rayon::prelude::*;
 use binius_verifier::{
 	config::{LOG_WORD_SIZE_BITS, WORD_SIZE_BITS, WORD_SIZE_BYTES},
@@ -21,7 +21,7 @@ use itertools::izip;
 use tracing::instrument;
 
 use super::{
-	key_collection::{KeyCollection, Operation},
+	key_collection::{KeyCollection, KeySegment, Operation},
 	monster::build_h_parts,
 	prove::PreparedOperatorData,
 };
@@ -38,17 +38,29 @@ pub fn prove_phase_1<F, P, Channel>(
 	words: &[Word],
 	bitand_data: &PreparedOperatorData<F>,
 	intmul_data: &PreparedOperatorData<F>,
+	domain_subspace: &BinarySubspace<F>,
 	channel: &mut Channel,
 ) -> SumcheckOutput<F>
 where
-	F: BinaryField + From<AESTowerField8b>,
+	F: BinaryField,
 	P: PackedField<Scalar = F>,
 	Channel: IPProverChannel<F>,
 {
-	let g_parts = build_g_parts::<_, P>(words, key_collection, bitand_data, intmul_data);
+	// Build the g parts for the public and hidden segments separately, then sum them. The public
+	// words are the prefix of `words`, and each segment's key ranges are segment-relative.
+	let (public_words, hidden_words) = words.split_at(key_collection.public.n_words());
+	let mut g_parts =
+		build_g_parts::<_, P>(public_words, &key_collection.public, bitand_data, intmul_data);
+	let hidden_g_parts =
+		build_g_parts::<_, P>(hidden_words, &key_collection.hidden, bitand_data, intmul_data);
+	for (g, hidden_g) in g_parts.iter_mut().zip(&hidden_g_parts) {
+		for (slot, add) in g.as_mut().iter_mut().zip(hidden_g.as_ref()) {
+			*slot += *add;
+		}
+	}
 
 	// BitAnd and IntMul share the same `r_zhat_prime`.
-	let h_parts = build_h_parts(bitand_data.r_zhat_prime);
+	let h_parts = build_h_parts(domain_subspace, bitand_data.r_zhat_prime);
 
 	run_phase_1_sumcheck(g_parts, h_parts, channel)
 }
@@ -140,17 +152,20 @@ pub fn run_phase_1_sumcheck<F: Field, P: PackedField<Scalar = F>, Channel: IPPro
 	}
 }
 
-/// Constructs the "g" multilinear parts for both BITAND and INTMUL operations.
+/// Constructs the "g" multilinear parts for both BITAND and INTMUL operations, for one key segment.
 ///
-/// This function builds the g multilinear polynomials used in phase 1 of the shift protocol.
-/// For each operation (BITAND and INTMUL), it constructs three multilinear polynomials
-/// corresponding to the three shift variants (SLL, SRL, SRA).
+/// This builds the g multilinear polynomials used in phase 1 of the shift protocol, over the words
+/// of a single value-vector segment (public or hidden). For each operation (BITAND and INTMUL) it
+/// constructs three multilinear polynomials corresponding to the three shift variants (SLL, SRL,
+/// SRA).
+///
+/// The value vector's public and hidden words participate through their own [`KeySegment`], so a
+/// caller builds each segment's parts with the matching words and sums the two results.
 ///
 /// # Construction Process
 ///
 /// 1. **Parallel Processing**: Words are processed in parallel chunks for efficiency
-/// 2. **Key Processing**: For each word, iterate through its associated keys from the key
-///    collection
+/// 2. **Key Processing**: For each word, iterate through its associated keys in the segment
 /// 3. **Accumulation**: For each key, accumulate its contribution weighted by the r_x' tensor
 /// 4. **Word Expansion**: Expand each witness word bitwise to populate the g multilinears
 /// 5. **Lambda Weighting**: Apply lambda powers to weight different operand positions
@@ -166,7 +181,7 @@ pub fn run_phase_1_sumcheck<F: Field, P: PackedField<Scalar = F>, Channel: IPPro
 #[instrument(skip_all, name = "build_g_parts")]
 pub fn build_g_parts<F: BinaryField, P: PackedField<Scalar = F>>(
 	words: &[Word],
-	key_collection: &KeyCollection,
+	segment: &KeySegment,
 	bitand_operator_data: &PreparedOperatorData<F>,
 	intmul_operator_data: &PreparedOperatorData<F>,
 ) -> [FieldBuffer<P>; SHIFT_VARIANT_COUNT] {
@@ -185,23 +200,13 @@ pub fn build_g_parts<F: BinaryField, P: PackedField<Scalar = F>>(
 	// A mask for low `P::WIDTH` bits.
 	let low_bits_mask = (1u8 << P::WIDTH) - 1;
 
-	// Process the public and hidden segments in absolute value-vector order: the public
-	// words are the prefix of `words`, and each segment's key ranges are segment-relative.
-	let (public_words, hidden_words) = words.split_at(key_collection.public.n_words());
-	let public_iter = public_words
+	// Each word carries the keys named by the segment-relative range at its position.
+	let multilinears = words
 		.par_iter()
-		.zip(key_collection.public.key_ranges.par_iter())
-		.map(|(word, range)| (word, range, &key_collection.public));
-	let hidden_iter = hidden_words
-		.par_iter()
-		.zip(key_collection.hidden.key_ranges.par_iter())
-		.map(|(word, range)| (word, range, &key_collection.hidden));
-
-	let multilinears = public_iter
-		.chain(hidden_iter)
+		.zip(segment.key_ranges.par_iter())
 		.fold(
 			|| zeroed_vec::<P>(acc_size).into_boxed_slice(),
-			|mut multilinears, (word, Range { start, end }, segment)| {
+			|mut multilinears, (word, Range { start, end })| {
 				let keys = &segment.keys[*start as usize..*end as usize];
 
 				for key in keys {
@@ -210,7 +215,11 @@ pub fn build_g_parts<F: BinaryField, P: PackedField<Scalar = F>>(
 						Operation::IntegerMul => intmul_operator_data,
 					};
 
-					let acc = key.accumulate(&segment.constraint_indices, operator_data);
+					let acc = key.accumulate(
+						&segment.constraint_indices,
+						operator_data.r_x_prime_tensor.as_ref(),
+						&operator_data.lambda_powers,
+					);
 					let acc_packed = P::broadcast(acc);
 
 					// The following loop is an optimized version of the following
@@ -220,11 +229,14 @@ pub fn build_g_parts<F: BinaryField, P: PackedField<Scalar = F>>(
 					//     }
 					// }
 					let start = key.id as usize * (WORD_SIZE_BITS >> P::LOG_WIDTH);
-					let word_bytes = word.0.to_le_bytes();
-					for (&byte, values) in word_bytes.iter().zip(
-						multilinears[start..start + (WORD_SIZE_BITS >> P::LOG_WIDTH)]
-							.chunks_exact_mut(WORD_SIZE_BYTES >> P::LOG_WIDTH),
-					) {
+					let values = &mut multilinears[start..start + (WORD_SIZE_BITS >> P::LOG_WIDTH)];
+					let values_per_byte = WORD_SIZE_BYTES >> P::LOG_WIDTH;
+					let mut remaining_word = word.0;
+					let mut byte_index = 0;
+					while remaining_word != 0 {
+						let byte = remaining_word as u8;
+						let byte_values =
+							&mut values[byte_index * values_per_byte..][..values_per_byte];
 						for value_index in 0..(8 >> P::LOG_WIDTH) {
 							unsafe {
 								let packed_mask_index =
@@ -240,10 +252,12 @@ pub fn build_g_parts<F: BinaryField, P: PackedField<Scalar = F>>(
 								//   due to the chunking
 								// - `value_index` is always in bounds because we iterate over 0..(8
 								//   >> P::LOG_WIDTH)
-								*values.get_unchecked_mut(value_index) +=
+								*byte_values.get_unchecked_mut(value_index) +=
 									acc_packed.select(packed_mask);
 							}
 						}
+						remaining_word >>= 8;
+						byte_index += 1;
 					}
 				}
 

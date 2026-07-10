@@ -5,7 +5,7 @@
 use std::mem::MaybeUninit;
 
 use binius_core::{
-	constraint_system::{AndConstraint, ShiftVariant, ShiftedValueIndex},
+	constraint_system::{AndConstraint, ShiftedValueIndex},
 	word::Word,
 };
 use binius_field::{AESTowerField8b as B8, PackedField};

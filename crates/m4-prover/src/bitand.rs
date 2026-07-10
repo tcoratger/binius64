@@ -342,7 +342,7 @@ impl OperandContext<'_> {
 
 				// The shift is fixed for the whole stripe, so test it once, not per word.
 				// An unshifted term is a left shift by zero, i.e. the identity.
-				if sv.shift_variant == ShiftVariant::Sll && amount == 0 {
+				if amount == 0 {
 					// Unshifted: XOR the raw words, skipping the shift entirely.
 					for (local, &word) in src.iter().enumerate() {
 						let slot = &mut out[local * self.n_and + self.j];

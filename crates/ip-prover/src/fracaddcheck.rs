@@ -7,7 +7,7 @@ use binius_ip::{mlecheck, prodcheck::MultilinearEvalClaim, sumcheck::RoundCoeffs
 use binius_math::{
 	FieldBuffer, line::extrapolate_line_packed, multilinear::eq::eq_ind_partial_eval,
 };
-use binius_utils::rayon::iter::{IntoParallelIterator, ParallelIterator};
+use binius_utils::rayon::prelude::*;
 use itertools::izip;
 
 use crate::{
@@ -29,6 +29,14 @@ pub type FracEvalClaim<F> = (MultilinearEvalClaim<F>, MultilinearEvalClaim<F>);
 /// Each layer is a double of the numerator and denominator values of fractional terms. Each layer
 /// represents the addition of siblings with respect to the fractional addition rule:
 /// $$\frac{a_0}{b_0} + \frac{a_1}{b_1} = \frac{a_0b_1 + a_1b_0}{b_0b_1}$
+///
+/// Every layer stays resident until proving consumes it.
+/// The layers halve in size going up, so the peak footprint is at most twice the leaf.
+/// Recomputing interior layers on demand would about halve the memory for double the build work.
+/// The resident layout instead keeps the build to a single pass.
+///
+/// Each layer owns its backing store, since proving folds it in place.
+/// So the layers cannot be slices carved from one shared allocation.
 pub struct FracAddCheckProver<P: PackedField> {
 	layers: Vec<(FieldBuffer<P>, FieldBuffer<P>)>,
 }
@@ -69,15 +77,43 @@ where
 			let (num_0, num_1) = num.split_half_ref();
 			let (den_0, den_1) = den.split_half_ref();
 
-			let (next_layer_num, next_layer_den) =
-				(num_0.as_ref(), den_0.as_ref(), num_1.as_ref(), den_1.as_ref())
-					.into_par_iter()
-					.map(|(&a_0, &b_0, &a_1, &b_1)| (a_0 * b_1 + a_1 * b_0, b_0 * b_1))
-					.collect::<(Vec<_>, Vec<_>)>();
+			// The next layer has one fewer variable, so it holds this many packed words.
+			let out_log_len = num.log_len() - 1;
+			let out_packed_len = 1 << out_log_len.saturating_sub(P::LOG_WIDTH);
+
+			// Backing store for the two output layers.
+			let mut num_out = Vec::<P>::with_capacity(out_packed_len);
+			let mut den_out = Vec::<P>::with_capacity(out_packed_len);
+
+			// Fill both layers in one fused parallel pass, straight into the spare capacity.
+			// Why: this avoids allocating and copying a pair of intermediate vectors per layer.
+			(
+				num_out.spare_capacity_mut().par_iter_mut(),
+				den_out.spare_capacity_mut().par_iter_mut(),
+				num_0.as_ref().par_iter(),
+				den_0.as_ref().par_iter(),
+				num_1.as_ref().par_iter(),
+				den_1.as_ref().par_iter(),
+			)
+				.into_par_iter()
+				.for_each(|(n_out, d_out, &a_0, &b_0, &a_1, &b_1)| {
+					// Fractional addition of the sibling terms a_0/b_0 and a_1/b_1.
+					n_out.write(a_0 * b_1 + a_1 * b_0);
+					d_out.write(b_0 * b_1);
+				});
+
+			// Safety: every slot of both buffers' spare capacity was initialized above.
+			//   - the six zipped iterators share one length: the packed word count,
+			//   - an indexed zip covers every index once, so no slot is skipped.
+			// The length set here equals that capacity.
+			unsafe {
+				num_out.set_len(out_packed_len);
+				den_out.set_len(out_packed_len);
+			}
 
 			let next_layer = (
-				FieldBuffer::new(num.log_len() - 1, next_layer_num.into_boxed_slice()),
-				FieldBuffer::new(den.log_len() - 1, next_layer_den.into_boxed_slice()),
+				FieldBuffer::new(out_log_len, num_out.into_boxed_slice()),
+				FieldBuffer::new(out_log_len, den_out.into_boxed_slice()),
 			);
 
 			layers.push(next_layer);

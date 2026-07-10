@@ -372,7 +372,7 @@ impl OperandContext<'_> {
 #[cfg(test)]
 mod tests {
 	use assert_matches::assert_matches;
-	use binius_core::constraint_system::ValueVec;
+	use binius_core::constraint_system::{ShiftVariant, ValueVec};
 	use binius_field::{
 		PackedBinaryGhash1x128b,
 		linear_transformation::{

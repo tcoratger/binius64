@@ -21,7 +21,7 @@ use crate::compiler::{hints::HintRegistry, pathspec::PathSpec};
 /// A register names a value-vector index.
 /// Reading or writing a register targets that index within one chosen instance.
 /// So an instruction is applied once per instance.
-pub(crate) trait EvalContext {
+pub trait EvalContext {
 	/// The number of independent instances evaluated in lockstep.
 	fn n_instances(&self) -> usize;
 
@@ -43,14 +43,14 @@ pub(crate) trait EvalContext {
 /// The cursor advances as the dispatch loop consumes opcodes and operands.
 /// One executor drives one pass over the bytecode.
 /// The interpreters build a fresh executor per run, so the cursor starts at the first instruction.
-pub(crate) struct Executor<'a> {
+pub struct Executor<'a> {
 	bytecode: &'a [u8],
 	hints: &'a HintRegistry,
 	pc: usize,
 }
 
 impl<'a> Executor<'a> {
-	pub(crate) const fn new(bytecode: &'a [u8], hints: &'a HintRegistry) -> Self {
+	pub const fn new(bytecode: &'a [u8], hints: &'a HintRegistry) -> Self {
 		Self {
 			bytecode,
 			hints,
@@ -67,7 +67,7 @@ impl<'a> Executor<'a> {
 	/// # Panics
 	///
 	/// Panics on an unknown opcode, which can only happen if the bytecode is malformed.
-	pub(crate) fn run<C: EvalContext>(&mut self, ctx: &mut C) {
+	pub fn run<C: EvalContext>(&mut self, ctx: &mut C) {
 		while self.pc < self.bytecode.len() {
 			let opcode = self.read_u8();
 			match opcode {

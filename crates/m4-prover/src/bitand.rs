@@ -339,9 +339,21 @@ impl OperandContext<'_> {
 				// Hidden word: this stripe's slice of row `idx - offset` is contiguous.
 				let row = idx - self.offset;
 				let src = &self.data[(row << self.log_instances) + self.base..][..self.width];
-				for (local, &word) in src.iter().enumerate() {
-					let slot = &mut out[local * self.n_and + self.j];
-					*slot = *slot ^ sv.shift_variant.apply(word, amount);
+
+				// The shift is fixed for the whole stripe, so test it once, not per word.
+				// An unshifted term is a left shift by zero, i.e. the identity.
+				if amount == 0 {
+					// Unshifted: XOR the raw words, skipping the shift entirely.
+					for (local, &word) in src.iter().enumerate() {
+						let slot = &mut out[local * self.n_and + self.j];
+						*slot = *slot ^ word;
+					}
+				} else {
+					// Shifted: apply the per-word shift.
+					for (local, &word) in src.iter().enumerate() {
+						let slot = &mut out[local * self.n_and + self.j];
+						*slot = *slot ^ sv.shift_variant.apply(word, amount);
+					}
 				}
 			} else {
 				// Public word: the same constant enters every instance of this stripe.
@@ -360,7 +372,7 @@ impl OperandContext<'_> {
 #[cfg(test)]
 mod tests {
 	use assert_matches::assert_matches;
-	use binius_core::constraint_system::ValueVec;
+	use binius_core::constraint_system::{ShiftVariant, ValueVec};
 	use binius_field::{
 		PackedBinaryGhash1x128b,
 		linear_transformation::{
@@ -630,6 +642,56 @@ mod tests {
 
 		// Every instance's block equals its independent single-instance reference.
 		// This includes instances at or beyond STRIPE_WIDTH, which only the second stripe produces.
+		for instance in 0..table.n_instances() {
+			let vv = table.instance_value_vec(instance, constants(&c));
+			let (a_ref, b_ref, c_ref) = reference_rows(&and_constraints, &vv);
+			let start = instance * n_and;
+			assert_eq!(&witness.a()[start..start + n_and], a_ref.as_slice());
+			assert_eq!(&witness.b()[start..start + n_and], b_ref.as_slice());
+			assert_eq!(&witness.c()[start..start + n_and], c_ref.as_slice());
+		}
+	}
+
+	#[test]
+	fn build_matches_reference_with_shifted_operands() {
+		let c = and_circuit();
+
+		// Fixture state: 4 instances with distinct inputs.
+		let table =
+			populate_table(&c, &[(1, 3, 7), (0xF0F0, 0x0FF0, 0xAA), (5, 6, 9), (0xFFFF, 1, 2)]);
+
+		// Hand-craft constraints that carry real shifts on hidden operands.
+		// The circuit compiler emits unshifted operands here, so the shifted branch of the
+		// accumulator would otherwise go untested by this module.
+		let x = c.circuit.witness_index(c.x);
+		let y = c.circuit.witness_index(c.y);
+		let z = c.circuit.witness_index(c.z);
+		let and_constraints = vec![
+			AndConstraint {
+				// A mixes a shifted and an unshifted term, exercising both accumulator paths.
+				a: vec![ShiftedValueIndex::sll(x, 3), ShiftedValueIndex::plain(y)],
+				b: vec![ShiftedValueIndex::srl(y, 5)],
+				c: vec![ShiftedValueIndex::sar(z, 7)],
+			},
+			// An empty operand set: its column must stay at the zeroed initial value.
+			AndConstraint::default(),
+		];
+
+		// Sanity: at least one operand term really is shifted, so the else-branch runs.
+		let shifted = and_constraints
+			.iter()
+			.flat_map(|con| [&con.a, &con.b, &con.c])
+			.any(|op| {
+				op.iter()
+					.any(|sv| sv.shift_variant != ShiftVariant::Sll || sv.amount != 0)
+			});
+		assert!(shifted, "fixture must contain a shifted operand");
+
+		let n_and = and_constraints.len();
+		let witness = BatchAndCheckWitness::build(&table, constants(&c), &and_constraints);
+
+		// Each instance's block equals the shift-aware value-vec reference for the same
+		// constraints.
 		for instance in 0..table.n_instances() {
 			let vv = table.instance_value_vec(instance, constants(&c));
 			let (a_ref, b_ref, c_ref) = reference_rows(&and_constraints, &vv);

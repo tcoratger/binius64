@@ -5,9 +5,13 @@
 
 mod bitand;
 mod prove;
+mod reduction;
 mod shift;
+#[cfg(test)]
+mod test_utils;
 mod value_table;
 
 pub use bitand::BatchAndCheckWitness;
 pub use prove::Prover;
+pub use reduction::{ReductionProverOutput, prove_reduction};
 pub use value_table::{BatchWitnessFiller, ValueTable};

@@ -24,7 +24,7 @@ use binius_field::{AESTowerField8b as B8, Field, PackedField};
 use binius_ip::sumcheck::SumcheckOutput;
 use binius_ip_prover::channel::IPProverChannel;
 use binius_math::BinarySubspace;
-use binius_prover::protocols::shift::{OperatorData, build_key_collection};
+use binius_prover::protocols::shift::{KeyCollection, OperatorData};
 use binius_utils::checked_arithmetics::checked_log_2;
 use binius_verifier::{config::B128, protocols::bitand::AndCheckOutput};
 
@@ -46,6 +46,7 @@ pub struct ReductionProverOutput {
 /// # Arguments
 ///
 /// - `cs`: the prepared single-instance constraint system shared by every instance.
+/// - `key_collection`: the shift keys for `cs`, built once in a setup phase and reused.
 /// - `table`: the populated wire-major batch witness.
 /// - `channel`: the prover channel recording messages and drawing Fiat-Shamir challenges.
 ///
@@ -54,6 +55,7 @@ pub struct ReductionProverOutput {
 /// Panics if the constraint system has any MUL constraints, which this reduction does not handle.
 pub fn prove_reduction<P, Channel>(
 	cs: &ConstraintSystem,
+	key_collection: &KeyCollection,
 	table: &ValueTable2,
 	channel: &mut Channel,
 ) -> ReductionProverOutput
@@ -92,10 +94,9 @@ where
 
 	// Reduce the operand claims to one witness evaluation.
 	// No MUL constraints here, so the intmul claim is a zero claim at an empty point.
-	let key_collection = build_key_collection(cs);
 	let domain = BinarySubspace::<B8>::with_dim(LOG_WORD_SIZE_BITS).isomorphic::<B128>();
 	let witness_claim = prove_shift::<B128, P, _>(
-		&key_collection,
+		key_collection,
 		&cs.constants,
 		&folded_witness,
 		OperatorData {
@@ -125,6 +126,7 @@ mod tests {
 	use binius_field::PackedBinaryGhash1x128b;
 	use binius_m4_verifier::verify_reduction;
 	use binius_math::{inner_product::inner_product, multilinear::eq::eq_ind_partial_eval};
+	use binius_prover::protocols::shift::build_key_collection;
 	use binius_transcript::{ProverTranscript, VerifierTranscript};
 	use binius_utils::checked_arithmetics::log2_ceil_usize;
 	use binius_verifier::config::StdChallenger;
@@ -171,14 +173,17 @@ mod tests {
 		let mut cs = c.circuit.constraint_system().clone();
 		cs.validate_and_prepare().unwrap();
 
+		// Setup phase: build the shift keys once, to be reused across proofs.
+		let key_collection = build_key_collection(&cs);
+
 		// Prove the reduction on a fresh transcript.
 		let mut prover_transcript = ProverTranscript::<StdChallenger>::default();
-		let prover_out = prove_reduction::<P, _>(&cs, &table, &mut prover_transcript);
+		let prover_out =
+			prove_reduction::<P, _>(&cs, &key_collection, &table, &mut prover_transcript);
 
 		// Verify by replaying the same transcript.
 		let mut verifier_transcript = prover_transcript.into_verifier();
-		let verifier_out =
-			verify_reduction(&cs, log_instances, &cs.constants, &mut verifier_transcript).unwrap();
+		let verifier_out = verify_reduction(&cs, log_instances, &mut verifier_transcript).unwrap();
 		verifier_transcript.finalize().unwrap();
 
 		// Both sides drew the same instance challenge and reached the same reduced claim.
@@ -222,9 +227,10 @@ mod tests {
 
 		let mut cs = c.circuit.constraint_system().clone();
 		cs.validate_and_prepare().unwrap();
+		let key_collection = build_key_collection(&cs);
 
 		let mut prover_transcript = ProverTranscript::<StdChallenger>::default();
-		let _ = prove_reduction::<P, _>(&cs, &table, &mut prover_transcript);
+		let _ = prove_reduction::<P, _>(&cs, &key_collection, &table, &mut prover_transcript);
 		let mut proof = prover_transcript.finalize();
 
 		// Flip a bit in the AND-check's first message.
@@ -232,7 +238,7 @@ mod tests {
 		proof[0] ^= 1;
 
 		let mut verifier_transcript = VerifierTranscript::new(StdChallenger::default(), proof);
-		match verify_reduction(&cs, log_instances, &cs.constants, &mut verifier_transcript) {
+		match verify_reduction(&cs, log_instances, &mut verifier_transcript) {
 			Err(_) => {}
 			Ok(_) => {
 				verifier_transcript

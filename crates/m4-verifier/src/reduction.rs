@@ -12,7 +12,7 @@
 //! The output is that witness claim together with `r_rho`.
 //! Binding the claim to the committed trace oracle is a later step, not done here.
 
-use binius_core::{constraint_system::ConstraintSystem, word::Word};
+use binius_core::constraint_system::ConstraintSystem;
 use binius_field::{AESTowerField8b as B8, Field};
 use binius_ip::channel::IPVerifierChannel;
 use binius_math::BinarySubspace;
@@ -42,7 +42,6 @@ pub struct ReductionVerifierOutput {
 ///
 /// - `cs`: the prepared single-instance constraint system shared by every instance.
 /// - `log_instances`: base-2 logarithm of the instance count.
-/// - `public_words`: the shared constant words, the same in every instance.
 /// - `channel`: the verifier channel reading messages and redrawing Fiat-Shamir challenges.
 ///
 /// # Errors
@@ -51,7 +50,6 @@ pub struct ReductionVerifierOutput {
 pub fn verify_reduction<Channel>(
 	cs: &ConstraintSystem,
 	log_instances: usize,
-	public_words: &[Word],
 	channel: &mut Channel,
 ) -> Result<ReductionVerifierOutput, Error>
 where
@@ -80,7 +78,7 @@ where
 	let domain = BinarySubspace::<B8>::with_dim(LOG_WORD_SIZE_BITS).isomorphic::<B128>();
 	shift::check_eval::<B128, _>(
 		cs,
-		public_words,
+		&cs.constants,
 		&bitand,
 		&intmul,
 		&domain,

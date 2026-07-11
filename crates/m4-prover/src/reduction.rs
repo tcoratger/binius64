@@ -65,6 +65,14 @@ where
 		"the M4 reduction handles only AND constraints; the circuit must have no MUL constraints"
 	);
 
+	// One base domain shared by the AND-check and the shift, consistent by construction.
+	// The AND-check's univariate-skip domain spans one dimension above the 64-bit word.
+	let andcheck_domain = BinarySubspace::<B8>::with_dim(Word::LOG_BITS + 1);
+	// The shift domain drops that extra dimension.
+	let shift_domain = andcheck_domain
+		.reduce_dim(Word::LOG_BITS)
+		.isomorphic::<B128>();
+
 	// AND-check the `A & B == C` relation over all `K * n_and` rows.
 	let and_witness = BatchAndCheckWitness::build(table, &cs.constants, &cs.and_constraints);
 	let AndCheckOutput {
@@ -73,7 +81,7 @@ where
 		c_eval,
 		z_challenge,
 		eval_point,
-	} = and_witness.prove::<P, _>(channel);
+	} = and_witness.prove::<P, _>(&andcheck_domain, channel);
 
 	// The row point is `r_x || r_rho`: the constraint index on the low coordinates, the instance
 	// index on the high coordinates.
@@ -91,7 +99,6 @@ where
 
 	// Reduce the operand claims to one witness evaluation.
 	// No MUL constraints here, so the intmul claim is a zero claim at an empty point.
-	let domain = BinarySubspace::<B8>::with_dim(Word::LOG_BITS).isomorphic::<B128>();
 	let witness_claim = prove_shift::<B128, P, _>(
 		key_collection,
 		&cs.constants,
@@ -106,7 +113,7 @@ where
 			r_zhat_prime: z_challenge,
 			r_x_prime: Vec::new(),
 		},
-		&domain,
+		&shift_domain,
 		channel,
 	);
 

@@ -2,7 +2,6 @@
 
 //! Verifier for the batched BitAnd reduction of the data-parallel M4 proof system.
 
-use binius_core::word::Word;
 use binius_field::AESTowerField8b as B8;
 use binius_ip::channel::IPVerifierChannel;
 use binius_math::BinarySubspace;
@@ -30,6 +29,8 @@ use binius_verifier::{
 /// # Arguments
 ///
 /// - `log_total_constraints`: base-2 logarithm of the total row count `K * n_and`.
+/// - `eval_domain`: the univariate-skip domain, one dimension above the 64-bit word. The caller
+///   passes it so it matches the shift reduction's domain by construction.
 /// - `channel`: the verifier channel that reads messages and redraws Fiat-Shamir challenges.
 ///
 /// The total row count is the instance count times the per-instance constraint count.
@@ -47,17 +48,15 @@ use binius_verifier::{
 /// Returns an error if any sumcheck round message or the final consistency check fails.
 pub fn verify_bitand_reduction<C>(
 	log_total_constraints: usize,
+	eval_domain: &BinarySubspace<B8>,
 	channel: &mut C,
 ) -> Result<AndCheckOutput<B128>, Error>
 where
 	C: IPVerifierChannel<B128, Elem = B128>,
 {
-	// The univariate-skip domain: the full B8 subspace, lifted to B128.
-	// It is then cut to one dimension above the 64-bit word.
+	// Lift the caller's univariate-skip domain to B128.
 	// The prover sends round-message evaluations over exactly this domain.
-	let eval_domain = BinarySubspace::<B8>::default()
-		.isomorphic::<B128>()
-		.reduce_dim(Word::LOG_BITS + 1);
+	let eval_domain = eval_domain.isomorphic::<B128>();
 
 	// The first few zerocheck coordinates are pinned to fixed small-field elements.
 	// The prover pins the same prefix, so both sides agree on this split.

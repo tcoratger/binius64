@@ -55,6 +55,14 @@ pub fn verify_reduction<Channel>(
 where
 	Channel: IPVerifierChannel<B128, Elem = B128>,
 {
+	// One base domain shared by the AND-check and the shift, consistent by construction.
+	// The AND-check's univariate-skip domain spans one dimension above the 64-bit word.
+	let andcheck_domain = BinarySubspace::<B8>::with_dim(Word::LOG_BITS + 1);
+	// The shift domain drops that extra dimension.
+	let shift_domain = andcheck_domain
+		.reduce_dim(Word::LOG_BITS)
+		.isomorphic::<B128>();
+
 	// AND-check over all `K * n_and` rows.
 	let log_n_and = checked_log_2(cs.and_constraints.len());
 	let AndCheckOutput {
@@ -63,7 +71,7 @@ where
 		c_eval,
 		z_challenge,
 		eval_point,
-	} = verify_bitand_reduction(log_instances + log_n_and, channel)?;
+	} = verify_bitand_reduction(log_instances + log_n_and, &andcheck_domain, channel)?;
 
 	// The row point is `r_x || r_rho`: the constraint index low, the instance index high.
 	let (r_x, r_rho) = eval_point.split_at(log_n_and);
@@ -75,13 +83,12 @@ where
 	let shift = shift::verify::<B128, _>(cs, &bitand, &intmul, channel)?;
 
 	// Tie in the shared constants through the public-input consistency check.
-	let domain = BinarySubspace::<B8>::with_dim(Word::LOG_BITS).isomorphic::<B128>();
 	shift::check_eval::<B128, _>(
 		cs,
 		&cs.constants,
 		&bitand,
 		&intmul,
-		&domain,
+		&shift_domain,
 		z_challenge,
 		&shift,
 		channel,

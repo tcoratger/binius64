@@ -235,6 +235,8 @@ impl BatchAndCheckWitness {
 	///
 	/// # Arguments
 	///
+	/// - `prover_message_domain`: the univariate-skip domain, one dimension above the 64-bit word.
+	///   The caller passes it so it matches the shift reduction's domain by construction.
 	/// - `channel`: the prover channel that records messages and draws Fiat-Shamir challenges.
 	///
 	/// # Returns
@@ -243,15 +245,15 @@ impl BatchAndCheckWitness {
 	/// - The claimed `A`, `B`, `C` evaluations.
 	/// - The univariate (bit-index) challenge.
 	/// - The multilinear evaluation point reached by the sumcheck.
-	pub fn prove<P, Channel>(self, channel: &mut Channel) -> AndCheckOutput<B128>
+	pub fn prove<P, Channel>(
+		self,
+		prover_message_domain: &BinarySubspace<B8>,
+		channel: &mut Channel,
+	) -> AndCheckOutput<B128>
 	where
 		P: PackedField<Scalar = B128>,
 		Channel: IPProverChannel<B128>,
 	{
-		// The univariate-skip domain spans one extra dimension above the 64-bit word.
-		// This is the same skip parameter the single-instance check uses.
-		let prover_message_domain = BinarySubspace::<B8>::with_dim(Word::LOG_BITS + 1);
-
 		let (a, b, c) = self.into_columns();
 
 		// X has `log_instances + log(n_and)` coordinates: the row count is a power of two.
@@ -398,6 +400,11 @@ mod tests {
 	/// A width-1 packed field keeps one scalar per element, so the SIMD sumcheck rounds stay
 	/// simple.
 	type P = PackedBinaryGhash1x128b;
+
+	// The univariate-skip domain the AND-check runs over: one dimension above the 64-bit word.
+	fn message_domain() -> BinarySubspace<B8> {
+		BinarySubspace::<B8>::with_dim(Word::LOG_BITS + 1)
+	}
 
 	/// Recomputes the true multilinear evaluation of one bit-column at the reduction's point.
 	///
@@ -716,10 +723,12 @@ mod tests {
 
 		// Prover and verifier agree on the reduced claim over the batched columns.
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		let prove_output = witness.prove::<P, _>(&mut prover_transcript);
+		let prove_output = witness.prove::<P, _>(&message_domain(), &mut prover_transcript);
 
 		let mut verifier_transcript = prover_transcript.into_verifier();
-		let verify_output = verify_bitand_reduction(log_total, &mut verifier_transcript).unwrap();
+		let verify_output =
+			verify_bitand_reduction(log_total, &message_domain(), &mut verifier_transcript)
+				.unwrap();
 		verifier_transcript
 			.finalize()
 			.expect("no trailing proof data");
@@ -742,7 +751,7 @@ mod tests {
 
 		// Produce a faithful proof.
 		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-		let _ = witness.prove::<P, _>(&mut prover_transcript);
+		let _ = witness.prove::<P, _>(&message_domain(), &mut prover_transcript);
 		let mut proof = prover_transcript.finalize();
 
 		// Mutation: flip a bit in the prover's first message, the univariate round evaluations.
@@ -752,7 +761,8 @@ mod tests {
 		// The final consistency check then no longer holds.
 		// So verification fails.
 		let mut verifier_transcript = VerifierTranscript::new(StdChallenger::default(), proof);
-		let err = verify_bitand_reduction(log_total, &mut verifier_transcript).unwrap_err();
+		let err = verify_bitand_reduction(log_total, &message_domain(), &mut verifier_transcript)
+			.unwrap_err();
 
 		// The closing check is `A_eval * B_eval - C_eval == sumcheck_eval`.
 		// The tampered message moves the claim, so this equality no longer holds.
@@ -786,11 +796,11 @@ mod tests {
 			let log_total = checked_log_2(witness.a().len());
 
 			let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
-			let prove_output = witness.prove::<P, _>(&mut prover_transcript);
+			let prove_output = witness.prove::<P, _>(&message_domain(), &mut prover_transcript);
 
 			let mut verifier_transcript = prover_transcript.into_verifier();
 			let verify_output =
-				verify_bitand_reduction(log_total, &mut verifier_transcript).unwrap();
+				verify_bitand_reduction(log_total, &message_domain(), &mut verifier_transcript).unwrap();
 			verifier_transcript.finalize().expect("no trailing proof data");
 
 			// Both sides reach the same reduced claim.

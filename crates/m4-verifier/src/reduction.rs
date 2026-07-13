@@ -27,7 +27,7 @@ use binius_verifier::{
 	},
 };
 
-use crate::verify_bitand_reduction;
+use crate::{padded_public_words, verify_bitand_reduction};
 
 /// The verifier's output of the M4 constraint reduction.
 pub struct ReductionVerifierOutput {
@@ -93,9 +93,12 @@ where
 	let shift = shift::verify::<B128, _>(cs, &bitand, &intmul, channel)?;
 
 	// Tie in the shared constants through the public-input consistency check.
+	// The shift reads the public words over a power-of-two hypercube.
+	// So pad the constant bank up to the layout's public length.
+	let public_words = padded_public_words(cs);
 	shift::check_eval::<B128, _>(
 		cs,
-		&cs.constants,
+		&public_words,
 		&bitand,
 		&intmul,
 		&shift_domain,

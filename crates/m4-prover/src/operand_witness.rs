@@ -9,11 +9,11 @@
 //! drives the AND-check zerocheck; [`build_intmul_witness`] builds the four IntMul columns, not
 //! yet consumed downstream.
 
-use std::{iter, ptr};
+use std::{iter, mem::MaybeUninit, ptr};
 
 use binius_core::{
 	ValueIndex,
-	constraint_system::{AndConstraint, MulConstraint, Operand},
+	constraint_system::{AndConstraint, MulConstraint, Operand, ShiftVariant, ShiftedValueIndex},
 	word::Word,
 };
 use binius_field::{AESTowerField8b as B8, PackedField};
@@ -95,16 +95,18 @@ impl BatchAndCheckWitness {
 	) -> Self {
 		let a_operand_iter = and_constraints.par_iter().map(|constraint| &constraint.a);
 		let b_operand_iter = and_constraints.par_iter().map(|constraint| &constraint.b);
-		let c_operand_iter = and_constraints.par_iter().map(|constraint| &constraint.c);
-		let ((a, b), c) = rayon::join(
-			|| {
-				rayon::join(
-					|| build_operation_witness(table, constants, a_operand_iter),
-					|| build_operation_witness(table, constants, b_operand_iter),
-				)
-			},
-			|| build_operation_witness(table, constants, c_operand_iter),
+		let (a, b) = rayon::join(
+			|| build_operation_witness(table, constants, a_operand_iter),
+			|| build_operation_witness(table, constants, b_operand_iter),
 		);
+
+		// Instead of constructing c from the original word Vec, it's cheaper to compute it from the
+		// constraint relation.
+		let c = (a.as_slice(), b.as_slice())
+			.into_par_iter()
+			.map(|(&a_i, &b_i)| a_i & b_i)
+			.collect();
+
 		Self { a, b, c }
 	}
 
@@ -266,73 +268,27 @@ pub fn build_operation_witness<'a>(
 			let mut shifted_indices_iter = operand.iter();
 
 			if let Some(shifted_index_0) = shifted_indices_iter.next() {
-				// Special handling for the first index, which initializes the output cell.
-				if shifted_index_0.value_index < witness_offset {
-					let constant = constants[shifted_index_0.value_index.0 as usize];
-					let shifted_constant = shifted_index_0
-						.shift_variant
-						.apply(constant, shifted_index_0.amount as usize);
-					for out_i in &mut *out_chunk {
-						out_i.write(shifted_constant);
-					}
-				} else {
-					let index = shifted_index_0.value_index.0 as usize - witness_offset.0 as usize;
-					let src =
-						&table_words[(index << log_instances)..((index + 1) << log_instances)];
-
-					if shifted_index_0.amount == 0 {
-						// Safety:
-						// * out_chunk.len() == src.len()
-						// * MaybeUninit<Word> has the same memory repr as Word
-						unsafe {
-							ptr::copy_nonoverlapping(
-								src.as_ptr(),
-								out_chunk.as_mut_ptr() as *mut Word,
-								out_chunk.len(),
-							)
-						};
-					} else {
-						for (out_i, &src_i) in iter::zip(&mut *out_chunk, src) {
-							out_i.write(
-								shifted_index_0
-									.shift_variant
-									.apply(src_i, shifted_index_0.amount as usize),
-							);
-						}
-					}
-				}
+				write_shifted_values(
+					out_chunk,
+					shifted_index_0,
+					constants,
+					table_words,
+					witness_offset,
+					log_instances,
+				);
 
 				// out_chunk is fully initialized in the block above.
 				let out_chunk = unsafe { out_chunk.assume_init_mut() };
 
 				for shifted_index in shifted_indices_iter {
-					if shifted_index.value_index < witness_offset {
-						let constant = constants[shifted_index.value_index.0 as usize];
-						let shifted_constant = shifted_index
-							.shift_variant
-							.apply(constant, shifted_index.amount as usize);
-						for out_i in &mut *out_chunk {
-							*out_i = *out_i ^ shifted_constant;
-						}
-					} else {
-						let index =
-							shifted_index.value_index.0 as usize - witness_offset.0 as usize;
-						let src =
-							&table_words[(index << log_instances)..((index + 1) << log_instances)];
-
-						if shifted_index.amount == 0 {
-							for (out_i, &src_i) in iter::zip(&mut *out_chunk, src) {
-								*out_i = *out_i ^ src_i;
-							}
-						} else {
-							for (out_i, &src_i) in iter::zip(&mut *out_chunk, src) {
-								let shifted_src_i = shifted_index
-									.shift_variant
-									.apply(src_i, shifted_index.amount as usize);
-								*out_i = *out_i ^ shifted_src_i;
-							}
-						}
-					}
+					accum_shifted_values(
+						out_chunk,
+						shifted_index,
+						constants,
+						table_words,
+						witness_offset,
+						log_instances,
+					);
 				}
 			} else {
 				// When the operand is empty, write 0 words to the stripe.
@@ -347,6 +303,156 @@ pub fn build_operation_witness<'a>(
 	// SAFETY: every element in `0..total` of every column was written above.
 	unsafe { out.set_len(1 << (log_instances + log_constraints)) };
 	out
+}
+
+/// Writes `shift(src[i])` into `out_chunk[i]` for every `i`, initializing each cell.
+///
+/// `shift` is a concrete per-variant closure bound once by the caller's match on
+/// [`ShiftVariant`], so each call site monomorphizes to a loop with the shift operation inlined,
+/// rather than branching on the variant every iteration.
+#[inline]
+fn write_shifted_words(
+	out_chunk: &mut [MaybeUninit<Word>],
+	src: &[Word],
+	shift: impl Fn(Word) -> Word,
+) {
+	for (out_i, &src_i) in iter::zip(out_chunk, src) {
+		out_i.write(shift(src_i));
+	}
+}
+
+/// Writes one shifted value into every element of `out_chunk`, initializing it.
+///
+/// This is the first term of an operand's accumulation: it initializes the cell rather than
+/// XOR-ing into it, so the caller need not zero `out_chunk` first. Use [`accum_shifted_values`]
+/// for every subsequent term.
+///
+/// # Arguments
+///
+/// - `out_chunk`: the uninitialized output cells to write, one per instance in this stripe.
+/// - `shifted_index`: the shifted value index to write.
+/// - `constants`: the circuit's constant words, shared by every instance.
+/// - `table_words`: the wire-major batch witness's hidden words.
+/// - `witness_offset`: the value index at which hidden words begin; public words lie below it.
+/// - `log_instances`: the base-2 logarithm of the instance count, i.e. one hidden row's stride.
+fn write_shifted_values(
+	out_chunk: &mut [MaybeUninit<Word>],
+	shifted_index: &ShiftedValueIndex,
+	constants: &[Word],
+	table_words: &[Word],
+	witness_offset: ValueIndex,
+	log_instances: usize,
+) {
+	let ShiftedValueIndex {
+		value_index,
+		shift_variant,
+		amount: shift_amount,
+	} = *shifted_index;
+	let amount = shift_amount as u32;
+
+	if value_index < witness_offset {
+		let constant = constants[value_index.0 as usize];
+		let shifted_constant = shift_variant.apply(constant, shift_amount as usize);
+		for out_i in &mut *out_chunk {
+			out_i.write(shifted_constant);
+		}
+	} else {
+		let index = value_index.0 as usize - witness_offset.0 as usize;
+		let src = &table_words[(index << log_instances)..((index + 1) << log_instances)];
+
+		if amount == 0 {
+			// Safety:
+			// * out_chunk.len() == src.len()
+			// * MaybeUninit<Word> has the same memory repr as Word
+			unsafe {
+				ptr::copy_nonoverlapping(
+					src.as_ptr(),
+					out_chunk.as_mut_ptr() as *mut Word,
+					out_chunk.len(),
+				)
+			};
+		} else {
+			match shift_variant {
+				ShiftVariant::Sll => write_shifted_words(out_chunk, src, |w| w << amount),
+				ShiftVariant::Slr => write_shifted_words(out_chunk, src, |w| w >> amount),
+				ShiftVariant::Sar => write_shifted_words(out_chunk, src, |w| w.sar(amount)),
+				ShiftVariant::Rotr => write_shifted_words(out_chunk, src, |w| w.rotr(amount)),
+				ShiftVariant::Sll32 => write_shifted_words(out_chunk, src, |w| w.sll32(amount)),
+				ShiftVariant::Srl32 => write_shifted_words(out_chunk, src, |w| w.srl32(amount)),
+				ShiftVariant::Sra32 => write_shifted_words(out_chunk, src, |w| w.sra32(amount)),
+				ShiftVariant::Rotr32 => write_shifted_words(out_chunk, src, |w| w.rotr32(amount)),
+			}
+		}
+	}
+}
+
+/// XORs `shift(src[i])` into `out_chunk[i]` for every `i`.
+///
+/// `shift` is a concrete per-variant closure bound once by the caller's match on
+/// [`ShiftVariant`], so each call site monomorphizes to a loop with the shift operation inlined,
+/// rather than branching on the variant every iteration.
+#[inline]
+fn xor_shifted_words(out_chunk: &mut [Word], src: &[Word], shift: impl Fn(Word) -> Word) {
+	for (out_i, &src_i) in iter::zip(out_chunk, src) {
+		*out_i = *out_i ^ shift(src_i);
+	}
+}
+
+/// XORs one shifted value into every element of `out_chunk`.
+///
+/// Use this for every term of an operand's accumulation after the first; see
+/// [`write_shifted_values`] for the first term, which initializes `out_chunk` instead.
+///
+/// # Arguments
+///
+/// - `out_chunk`: the initialized output cells to accumulate into, one per instance in this stripe.
+/// - `shifted_index`: the shifted value index to accumulate.
+/// - `constants`: the circuit's constant words, shared by every instance.
+/// - `table_words`: the wire-major batch witness's hidden words.
+/// - `witness_offset`: the value index at which hidden words begin; public words lie below it.
+/// - `log_instances`: the base-2 logarithm of the instance count, i.e. one hidden row's stride.
+fn accum_shifted_values(
+	out_chunk: &mut [Word],
+	shifted_index: &ShiftedValueIndex,
+	constants: &[Word],
+	table_words: &[Word],
+	witness_offset: ValueIndex,
+	log_instances: usize,
+) {
+	let ShiftedValueIndex {
+		value_index,
+		shift_variant,
+		amount: shift_amount,
+	} = *shifted_index;
+	let amount = shift_amount as u32;
+
+	if value_index < witness_offset {
+		let constant = constants[value_index.0 as usize];
+		let shifted_constant = shift_variant.apply(constant, shift_amount as usize);
+		for out_i in &mut *out_chunk {
+			*out_i = *out_i ^ shifted_constant;
+		}
+	} else {
+		let index = value_index.0 as usize - witness_offset.0 as usize;
+		let src = &table_words[(index << log_instances)..((index + 1) << log_instances)];
+
+		if amount == 0 {
+			for (out_i, &src_i) in iter::zip(&mut *out_chunk, src) {
+				*out_i = *out_i ^ src_i;
+			}
+		} else {
+			match shift_variant {
+				ShiftVariant::Sll => xor_shifted_words(out_chunk, src, |w| w << amount),
+				ShiftVariant::Slr => xor_shifted_words(out_chunk, src, |w| w >> amount),
+				ShiftVariant::Sar => xor_shifted_words(out_chunk, src, |w| w.sar(amount)),
+				ShiftVariant::Rotr => xor_shifted_words(out_chunk, src, |w| w.rotr(amount)),
+				ShiftVariant::Sll32 => xor_shifted_words(out_chunk, src, |w| w.sll32(amount)),
+				ShiftVariant::Srl32 => xor_shifted_words(out_chunk, src, |w| w.srl32(amount)),
+				ShiftVariant::Sra32 => xor_shifted_words(out_chunk, src, |w| w.sra32(amount)),
+				ShiftVariant::Rotr32 => xor_shifted_words(out_chunk, src, |w| w.rotr32(amount)),
+			}
+		}
+	}
 }
 
 /// Builds the batched IntMul operand witness from a populated wire-major batch table.
@@ -395,7 +501,7 @@ pub fn build_intmul_witness(
 #[cfg(test)]
 mod tests {
 	use assert_matches::assert_matches;
-	use binius_core::constraint_system::{ShiftVariant, ShiftedValueIndex, ValueVec};
+	use binius_core::constraint_system::ValueVec;
 	use binius_field::{
 		PackedBinaryGhash1x128b,
 		linear_transformation::{
@@ -783,6 +889,10 @@ mod tests {
 		// Hand-craft constraints that carry real shifts on hidden operands.
 		// The circuit compiler emits unshifted operands here, so the shifted branch of the
 		// accumulator would otherwise go untested by this module.
+		//
+		// The `c` operand is deliberately unrelated to `a & b`: `BatchAndCheckWitness::build`
+		// derives `c` from `a` and `b` rather than evaluating the constraint's `c` operand, so this
+		// fixture need not satisfy the AND relation to exercise `a` and `b`'s shift handling.
 		let x = c.circuit.witness_index(c.x);
 		let y = c.circuit.witness_index(c.y);
 		let z = c.circuit.witness_index(c.z);
@@ -800,7 +910,7 @@ mod tests {
 		// Sanity: at least one operand term really is shifted, so the else-branch runs.
 		let shifted = and_constraints
 			.iter()
-			.flat_map(|con| [&con.a, &con.b, &con.c])
+			.flat_map(|con| [&con.a, &con.b])
 			.any(|op| {
 				op.iter()
 					.any(|sv| sv.shift_variant != ShiftVariant::Sll || sv.amount != 0)
@@ -809,12 +919,15 @@ mod tests {
 
 		let witness = BatchAndCheckWitness::build(&table, constants(&c), &and_constraints);
 
-		// Each constraint's block equals the shift-aware value-vec reference for the same
-		// constraints.
-		let (a_ref, b_ref, c_ref) = reference_columns(&table, constants(&c), &and_constraints);
+		// `a` and `b` equal the shift-aware value-vec reference for the same constraints.
+		let (a_ref, b_ref, _) = reference_columns(&table, constants(&c), &and_constraints);
 		assert_eq!(witness.a(), a_ref.as_slice());
 		assert_eq!(witness.b(), b_ref.as_slice());
-		assert_eq!(witness.c(), c_ref.as_slice());
+
+		// `c` is defined as `a & b`, not evaluated from the constraint's `c` operand.
+		for ((a, b), c) in witness.a().iter().zip(witness.b()).zip(witness.c()) {
+			assert_eq!(a.0 & b.0, c.0);
+		}
 	}
 
 	#[test]

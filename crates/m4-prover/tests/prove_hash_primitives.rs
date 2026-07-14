@@ -29,7 +29,7 @@ use tracing_forest::ForestLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Base-2 logarithm of the instance count.
-const LOG_INSTANCES: usize = 0;
+const LOG_INSTANCES: usize = 10;
 
 /// Base-2 logarithm of the inverse Reed-Solomon rate: rate 1/2, matching the hash benches.
 const LOG_INV_RATE: usize = 1;
@@ -47,7 +47,7 @@ fn init_tracing() {
 	// Default to DEBUG, the level the prover's spans are recorded at.
 	// RUST_LOG overrides this default.
 	let env_filter = EnvFilter::builder()
-		.with_default_directive(LevelFilter::DEBUG.into())
+		.with_default_directive(LevelFilter::WARN.into())
 		.from_env_lossy();
 
 	// A second call does nothing once a global subscriber is installed.

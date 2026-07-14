@@ -28,7 +28,7 @@ use tracing::{info_span, level_filters::LevelFilter};
 use tracing_forest::ForestLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Base-2 logarithm of the instance count: one instance, since each primitive is proved once.
+/// Base-2 logarithm of the instance count.
 const LOG_INSTANCES: usize = 0;
 
 /// Base-2 logarithm of the inverse Reed-Solomon rate: rate 1/2, matching the hash benches.

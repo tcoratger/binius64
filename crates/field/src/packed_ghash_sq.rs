@@ -15,16 +15,19 @@
 //! multiplies, not four.
 
 use std::{
+	array,
 	iter::Sum,
-	ops::{Add, AddAssign, Sub, SubAssign},
+	ops::{Add, AddAssign, Mul, Sub, SubAssign},
 };
+
+use bytemuck::Pod;
 
 use crate::{
 	BinaryField128bGhash, Divisible, GhashSq256b, PackedField, WideMul,
-	arch::{M128, M256, M512, PackedPrimitiveType},
+	arch::{LaneWideProduct, M128, M256, M512, PackedPrimitiveType},
 	arithmetic_traits::{InvertOrZero, Square},
 	sliced_packed_field::SlicedPackedField,
-	underlier::{UnderlierType, WithUnderlier},
+	underlier::{SlicedUnderlier, UnderlierType, WithUnderlier},
 };
 
 /// The packed GHASH coordinate register backing a `SlicedGhashSq256b<U>`.
@@ -196,14 +199,104 @@ where
 	}
 }
 
+/// The GHASH subfield view of a sliced GHASH² packing — the target of a [`PackedSubfield`] cast.
+///
+/// A sliced GHASH² packing is `N` GHASH limbs sharing one sliced underlier.
+/// Reinterpreting the same bytes as a packed GHASH field yields this type.
+/// Its lanes are the extension coordinates, read in the sliced order.
+/// GHASH arithmetic acts per lane.
+/// So each operation delegates to the limbs — one full-width CLMUL per limb, not a scalar loop.
+///
+/// [`PackedSubfield`]: crate::PackedSubfield
+type SlicedGhashSubfield<U, const N: usize> =
+	PackedPrimitiveType<SlicedUnderlier<U, M128, N>, BinaryField128bGhash>;
+
+impl<U, const N: usize> Square for SlicedGhashSubfield<U, N>
+where
+	U: UnderlierType + Divisible<M128> + Pod,
+	Ghash<U>: PackedField<Scalar = BinaryField128bGhash>,
+{
+	#[inline]
+	fn square(self) -> Self {
+		// Square each limb's GHASH register independently.
+		let limbs = self.to_underlier().0;
+		Self::from_underlier(SlicedUnderlier::new(
+			limbs.map(|limb| Square::square(Ghash::<U>::from_underlier(limb)).to_underlier()),
+		))
+	}
+}
+
+impl<U, const N: usize> InvertOrZero for SlicedGhashSubfield<U, N>
+where
+	U: UnderlierType + Divisible<M128> + Pod,
+	Ghash<U>: PackedField<Scalar = BinaryField128bGhash>,
+{
+	#[inline]
+	fn invert_or_zero(self) -> Self {
+		// Invert each limb's GHASH register independently.
+		// A zero lane maps to a zero lane.
+		let limbs = self.to_underlier().0;
+		Self::from_underlier(SlicedUnderlier::new(limbs.map(|limb| {
+			InvertOrZero::invert_or_zero(Ghash::<U>::from_underlier(limb)).to_underlier()
+		})))
+	}
+}
+
+impl<U, const N: usize> Mul for SlicedGhashSubfield<U, N>
+where
+	U: UnderlierType + Divisible<M128> + Pod,
+	Ghash<U>: PackedField<Scalar = BinaryField128bGhash>,
+{
+	type Output = Self;
+
+	#[inline]
+	fn mul(self, rhs: Self) -> Self {
+		// Multiply limb by limb.
+		// Both operands' lane `l` sit at the same physical position, so per-limb products align.
+		let (a, b) = (self.to_underlier().0, rhs.to_underlier().0);
+		Self::from_underlier(SlicedUnderlier::new(array::from_fn(|i| {
+			(Ghash::<U>::from_underlier(a[i]) * Ghash::<U>::from_underlier(b[i])).to_underlier()
+		})))
+	}
+}
+
+impl<U, const N: usize> WideMul for SlicedGhashSubfield<U, N>
+where
+	U: UnderlierType + Divisible<M128> + Pod,
+	Ghash<U>: PackedField<Scalar = BinaryField128bGhash> + WideMul,
+	GhashWide<U>: Copy + Default,
+{
+	// One deferred GHASH product per limb, reduced independently.
+	type Output = LaneWideProduct<GhashWide<U>, N>;
+
+	#[inline]
+	fn wide_mul(lhs: Self, rhs: Self) -> Self::Output {
+		let (a, b) = (lhs.to_underlier().0, rhs.to_underlier().0);
+		LaneWideProduct(array::from_fn(|i| {
+			<Ghash<U> as WideMul>::wide_mul(
+				Ghash::from_underlier(a[i]),
+				Ghash::from_underlier(b[i]),
+			)
+		}))
+	}
+
+	#[inline]
+	fn reduce(wide: Self::Output) -> Self {
+		Self::from_underlier(SlicedUnderlier::new(array::from_fn(|i| {
+			<Ghash<U> as WideMul>::reduce(wide.0[i]).to_underlier()
+		})))
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use rand::{Rng, SeedableRng, rngs::StdRng};
 
 	use super::*;
 	use crate::{
-		Divisible, Field, PackedField, Random,
+		Divisible, ExtensionField, Field, PackedField, PackedSubfield, Random,
 		arithmetic_traits::{InvertOrZero, Square},
+		cast_bases_mut,
 		field::FieldOps,
 	};
 
@@ -262,6 +355,87 @@ mod tests {
 
 		// `one` is the multiplicative identity in every lane.
 		assert_eq!(a * <P as FieldOps>::one(), a);
+	}
+
+	fn check_underlier_transpose<P>(mut rng: impl Rng)
+	where
+		P: PackedField<Scalar = GhashSq256b> + WithUnderlier,
+		P::Underlier: Divisible<M128>,
+	{
+		// The packing reinterprets to a sliced underlier.
+		// Its 128-bit subdivisions come out element-major, coordinate-minor:
+		//
+		//     [ c0(x0), c1(x0), c0(x1), c1(x1), ... ]
+		//
+		// `cj(xk)` is the j-th GHASH coordinate of lane k.
+		let p = P::random(&mut rng);
+		let got: Vec<M128> = Divisible::<M128>::value_iter(p.to_underlier()).collect();
+
+		// Reference: read each lane's scalar, then its two GHASH coordinates in order.
+		let mut expected = Vec::with_capacity(P::WIDTH * 2);
+		for lane in 0..P::WIDTH {
+			let scalar = p.get(lane);
+			for j in 0..2 {
+				let coord =
+					<GhashSq256b as ExtensionField<BinaryField128bGhash>>::get_base(&scalar, j);
+				expected.push(coord.to_underlier());
+			}
+		}
+		assert_eq!(got, expected);
+	}
+
+	fn check_subfield_cast<P>(mut rng: impl Rng)
+	where
+		P: PackedField<Scalar = GhashSq256b> + WithUnderlier,
+		PackedSubfield<P, BinaryField128bGhash>: PackedField<Scalar = BinaryField128bGhash>,
+	{
+		// This drives the real cast that transpose and ring-switch use.
+		// It reinterprets a slice of GHASH² packings as their GHASH coordinates.
+		// The coordinates must come out element-major, coordinate-minor:
+		//
+		//     packing 0: [ c0(x0), c1(x0), c0(x1), c1(x1), ... ], then packing 1, ...
+		let mut exts = [P::random(&mut rng), P::random(&mut rng)];
+
+		let expected: Vec<BinaryField128bGhash> = exts
+			.iter()
+			.flat_map(|e| {
+				(0..P::WIDTH).flat_map(move |lane| {
+					let s = e.get(lane);
+					(0..2).map(move |j| {
+						<GhashSq256b as ExtensionField<BinaryField128bGhash>>::get_base(&s, j)
+					})
+				})
+			})
+			.collect();
+
+		let bases = cast_bases_mut::<BinaryField128bGhash, P>(&mut exts);
+		let got: Vec<BinaryField128bGhash> = bases.iter().flat_map(|b| b.iter()).collect();
+		assert_eq!(got, expected);
+	}
+
+	fn check_subfield_arithmetic<P>(mut rng: impl Rng)
+	where
+		P: PackedField<Scalar = GhashSq256b> + WithUnderlier,
+		PackedSubfield<P, BinaryField128bGhash>: PackedField<Scalar = BinaryField128bGhash>,
+	{
+		// The coordinate view is a GHASH packing.
+		// Its arithmetic must act independently per lane.
+		let a = <PackedSubfield<P, BinaryField128bGhash>>::random(&mut rng);
+		let b = <PackedSubfield<P, BinaryField128bGhash>>::random(&mut rng);
+
+		let prod = a * b;
+		let sq = Square::square(a);
+		let inv = InvertOrZero::invert_or_zero(a);
+
+		for i in 0..<PackedSubfield<P, BinaryField128bGhash>>::WIDTH {
+			let (x, y) = (a.get(i), b.get(i));
+			assert_eq!(prod.get(i), x * y);
+			assert_eq!(sq.get(i), Square::square(x));
+			assert_eq!(inv.get(i), x.invert_or_zero());
+			if x != BinaryField128bGhash::ZERO {
+				assert_eq!(x * inv.get(i), BinaryField128bGhash::ONE);
+			}
+		}
 	}
 
 	fn check_get_set_iter<P: PackedField<Scalar = GhashSq256b>>(mut rng: impl Rng) {
@@ -370,6 +544,27 @@ mod tests {
 				fn get_set_iter() {
 					for seed in 0..64 {
 						check_get_set_iter::<$ty>(StdRng::seed_from_u64(seed));
+					}
+				}
+
+				#[test]
+				fn underlier_transpose() {
+					for seed in 0..64 {
+						check_underlier_transpose::<$ty>(StdRng::seed_from_u64(seed));
+					}
+				}
+
+				#[test]
+				fn subfield_cast() {
+					for seed in 0..64 {
+						check_subfield_cast::<$ty>(StdRng::seed_from_u64(seed));
+					}
+				}
+
+				#[test]
+				fn subfield_arithmetic() {
+					for seed in 0..64 {
+						check_subfield_arithmetic::<$ty>(StdRng::seed_from_u64(seed));
 					}
 				}
 

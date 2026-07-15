@@ -52,14 +52,26 @@ use std::{
 	ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign},
 };
 
-use bytemuck::Zeroable;
+use bytemuck::{Pod, TransparentWrapper, Zeroable};
 use rand::distr::{Distribution, StandardUniform};
 
 use crate::{
-	Divisible, ExtensionField, Field, Maskable, PackedField, WideMul,
+	BinaryField, Divisible, ExtensionField, Field, Maskable, PackedField, WideMul,
 	arithmetic_traits::{InvertOrZero, Square},
 	field::FieldOps,
+	underlier::{SlicedUnderlier, WithUnderlier},
 };
+
+/// The underlier a sliced packing reinterprets to when its coordinate register is underlier-backed.
+///
+/// It stacks `N` coordinate-register underliers, transposed at the subfield scalar's underlier.
+/// Reading those subdivisions in order, one per limb, reassembles each extension scalar.
+/// That order matches the packing's own scalar access, which is what makes the reinterpret sound.
+type SlicedPackedUnderlier<PSub, const N: usize> = SlicedUnderlier<
+	<PSub as WithUnderlier>::Underlier,
+	<<PSub as FieldOps>::Scalar as WithUnderlier>::Underlier,
+	N,
+>;
 
 /// A packed extension field stored as `N` packed subfield coordinate registers.
 ///
@@ -134,6 +146,27 @@ impl<F, PSub: PackedField, const N: usize> Debug for SlicedPackedField<F, PSub, 
 // SAFETY: the struct is `[PSub; N]` plus a zero-sized `PhantomData`; an all-zero bit pattern is a
 // valid `[PSub; N]` whenever `PSub: Zeroable`.
 unsafe impl<F, PSub: Zeroable, const N: usize> Zeroable for SlicedPackedField<F, PSub, N> {}
+
+// SAFETY: the packing is `#[repr(transparent)]` over `[PSub; N]`, and each register is transparent
+// over its own underlier, so `[PSub; N]` shares the layout of the sliced underlier's payload.
+// Wrapping and peeling only reinterpret bytes between equal-layout types.
+unsafe impl<F, PSub, const N: usize> TransparentWrapper<SlicedPackedUnderlier<PSub, N>>
+	for SlicedPackedField<F, PSub, N>
+where
+	PSub: PackedField + WithUnderlier,
+	<PSub as FieldOps>::Scalar: BinaryField,
+{
+}
+
+unsafe impl<F, PSub, const N: usize> WithUnderlier for SlicedPackedField<F, PSub, N>
+where
+	F: Send + Sync + 'static,
+	PSub: PackedField + WithUnderlier,
+	<PSub as FieldOps>::Scalar: BinaryField,
+	PSub::Underlier: Divisible<<<PSub as FieldOps>::Scalar as WithUnderlier>::Underlier> + Pod,
+{
+	type Underlier = SlicedPackedUnderlier<PSub, N>;
+}
 
 // --- Additive group: coordinate-wise (a binary field is characteristic two, so neg is identity).
 

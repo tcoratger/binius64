@@ -18,7 +18,7 @@ use binius_ip_prover::{
 		batch::{BatchSumcheckOutput, batch_prove, batch_prove_and_write_evals},
 		bivariate_product_mle,
 		multilinear_eval::MultilinearEvalProver,
-		quadratic_mle::QuadraticMleCheckProver,
+		quadratic_mlecheck_prover,
 		selector_mle::{Claim, SelectorMlecheckProver},
 	},
 };
@@ -290,14 +290,13 @@ where
 
 		// The overflow parity check binds at the Phase-2 constraint point `b_eval_point` (r_2) —
 		// reused for free from the `b` re-randomization.
-		let overflow_prover =
-			MleToSumCheckDecorator::new(QuadraticMleCheckProver::<P, _, _, 3>::new(
-				[a_0, b_0, c_lo_0],
-				|[a, b, c]| a * b - c,
-				|[a, b, _c]| a * b,
-				b_eval_point.to_vec(),
-				F::ZERO,
-			));
+		let overflow_prover = MleToSumCheckDecorator::new(quadratic_mlecheck_prover(
+			[a_0, b_0, c_lo_0],
+			|[a, b, c]| a * b - c,
+			|[a, b, _c]| a * b,
+			b_eval_point.to_vec(),
+			F::ZERO,
+		));
 
 		// Fold the 2^k b bit-columns by the recombination tensor into a single field multilinear
 		// B(x) = sum_i eq(r_I^b, i) * b(i, x), then re-randomize its claim B(r_2) = b_recomb from

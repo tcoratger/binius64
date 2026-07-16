@@ -9,7 +9,7 @@ use binius_field::{
 		OutputWrappingTransformationFactory,
 	},
 };
-use binius_ip_prover::sumcheck::{common::SumcheckProver, quadratic_mle::QuadraticMleCheckProver};
+use binius_ip_prover::sumcheck::{common::SumcheckProver, quadratic_mlecheck_prover};
 use binius_math::{
 	BinarySubspace,
 	univariate::{extrapolate_over_subspace, lagrange_evals_scalars},
@@ -119,7 +119,7 @@ fn bench(c: &mut Criterion) {
 						.chain(big_field_zerocheck_challenges.iter().copied())
 						.collect();
 
-				let mut prover = QuadraticMleCheckProver::new(
+				let mut prover = quadratic_mlecheck_prover(
 					proving_polys,
 					|[a, b, c]| a * b - c,
 					|[a, b, _]| a * b,

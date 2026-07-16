@@ -143,16 +143,19 @@ mod tests {
 	use rand::prelude::*;
 
 	use super::*;
-	use crate::sumcheck::{prove_single_mlecheck, quadratic_mle::QuadraticMleCheckProver};
+	use crate::sumcheck::{
+		prove_single_mlecheck, quadratic_mle_evaluator::quadratic_mlecheck_prover,
+	};
 
 	type F = OptimalB128;
 	type P = OptimalPackedB128;
 	type StdChallenger = HasherChallenger<sha2::Sha256>;
 
-	// A `QuadraticMleCheckProver` with the identity composition (and zero infinity composition) is
-	// a degree-1 MLE-check over a single multilinear — exactly what `MultilinearEvalProver`
-	// computes, just with the high (always-zero) degree-2 coefficient included. Drive both in
-	// lockstep and compare round polynomials and final evaluations.
+	// A quadratic MLE-check with the identity composition and a zero infinity composition is a
+	// degree-1 MLE-check over a single multilinear.
+	// That is exactly the single-multilinear evaluation reduction under test, with an always-zero
+	// degree-2 coefficient tacked on.
+	// Drive both in lockstep and compare round polynomials and final evaluations.
 	#[test]
 	fn test_conformance_with_quadratic_mlecheck() {
 		let mut rng = StdRng::seed_from_u64(0);
@@ -163,7 +166,7 @@ mod tests {
 		let eval_claim = evaluate(&witness, &eval_point);
 
 		let mut eval_prover = MultilinearEvalProver::new(witness.clone(), &eval_point, eval_claim);
-		let mut quadratic_prover = QuadraticMleCheckProver::new(
+		let mut quadratic_prover = quadratic_mlecheck_prover(
 			[witness],
 			|[a]: [P; 1]| a,
 			|[_a]: [P; 1]| P::zero(),

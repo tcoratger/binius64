@@ -1,9 +1,13 @@
 // Copyright 2023-2025 Irreducible Inc.
 
 use binius_field::{Field, PackedField};
-use binius_math::AsSlicesMut;
+use binius_math::FieldBuffer;
 
-use super::quadratic_mle::QuadraticMleCheckProver;
+use super::{
+	mle_store::MleStore,
+	quadratic_mle_evaluator::{QuadraticMleEvaluator, quadratic_mlecheck_prover},
+	round_evaluator::SharedMleCheckProver,
+};
 use crate::sumcheck::common::MleCheckProver;
 
 /// Creates an [`MleCheckProver`] that reduces an evaluation claim on a multilinear extension
@@ -50,7 +54,7 @@ use crate::sumcheck::common::MleCheckProver;
 ///
 /// [Gruen24]: <https://eprint.iacr.org/2024/108>
 pub fn new<F, P>(
-	multilinears: impl AsSlicesMut<P, 2> + Send + 'static,
+	multilinears: [FieldBuffer<P>; 2],
 	eval_point: Vec<F>,
 	eval_claim: F,
 ) -> impl MleCheckProver<F>
@@ -58,13 +62,45 @@ where
 	F: Field,
 	P: PackedField<Scalar = F>,
 {
-	QuadraticMleCheckProver::new(
-		multilinears,
-		|[a, b]| a * b,
-		|[a, b]| a * b,
-		eval_point,
+	// The product is symmetric, so the infinity composition (highest-degree terms) equals the full
+	// composition.
+	quadratic_mlecheck_prover(multilinears, |[a, b]| a * b, |[a, b]| a * b, eval_point, eval_claim)
+}
+
+/// Reduces the product of the two halves of a single buffer, sharing one allocation.
+///
+/// `buffer` has one more variable than `eval_point`:
+/// - its low half fixes the highest variable to 0,
+/// - its high half fixes it to 1.
+///
+/// The reduction proves the product of those two halves.
+/// Both halves live inside the one buffer, so separating them costs no copy.
+/// This is the zero-copy path the product-check layer reduction uses on its large witness layers.
+///
+/// # Returns
+///
+/// A prover whose reduction emits the low half's evaluation, then the high half's.
+pub fn new_split_half<F, P>(
+	buffer: FieldBuffer<P>,
+	eval_point: Vec<F>,
+	eval_claim: F,
+) -> impl MleCheckProver<F>
+where
+	F: Field,
+	P: PackedField<Scalar = F>,
+{
+	let mut store = MleStore::new(eval_point.len());
+	// The store checks that the buffer has exactly one more variable than itself.
+	let cols = store.push_split_half(buffer);
+	let eq_tracker = store.register_eq_tracker(&eval_point);
+	let evaluator = QuadraticMleEvaluator::new(
+		cols,
+		eq_tracker,
+		|[a, b]: [P; 2]| a * b,
+		|[a, b]: [P; 2]| a * b,
 		eval_claim,
-	)
+	);
+	SharedMleCheckProver::new(store, vec![evaluator], eval_point)
 }
 
 #[cfg(test)]

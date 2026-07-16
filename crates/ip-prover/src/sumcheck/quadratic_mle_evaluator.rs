@@ -2,11 +2,12 @@
 
 use binius_field::{Field, PackedField, WideMul};
 use binius_ip::sumcheck::RoundCoeffs;
+use binius_math::FieldBuffer;
 
 use super::{
 	mle_store::{ColId, ColumnChunk, EqId, EvaluationChunk, MleStore},
 	round_evals::RoundEvals2,
-	round_evaluator::RoundEvaluator,
+	round_evaluator::{RoundEvaluator, SharedMleCheckProver},
 };
 
 /// MLE-check round evaluator for one quadratic composition over N store columns.
@@ -74,6 +75,65 @@ where
 			last_coeffs_or_eval: RoundCoeffsOrEval::Eval(eval_claim),
 		}
 	}
+}
+
+/// Builds an MLE-check prover for one quadratic composition of N owned multilinears.
+///
+/// The reduced claim is
+///
+/// ```text
+///     sum_{v in B} C(M_0(v), ..., M_{N-1}(v)) * eq(v, eval_point) = eval_claim
+/// ```
+///
+/// for composition `C` over the boolean hypercube `B`.
+/// It reduces to one evaluation claim per input multilinear at the challenge point.
+///
+/// This is the single-claim path.
+/// Several quadratic claims that share columns are instead proved together by registering one
+/// evaluator per claim on a shared store, which folds each shared column only once.
+///
+/// # Arguments
+///
+/// * `multilinears` - The N input multilinears, each over `eval_point.len()` variables.
+/// * `composition` - Evaluates the quadratic composition, e.g. `|[a, b, c]| a * b - c`.
+/// * `infinity_composition` - The composition's highest-degree terms, for the Karatsuba evaluation
+///   at infinity, e.g. `|[a, b, _c]| a * b`.
+/// * `eval_point` - The point at which the composite MLE is claimed.
+/// * `eval_claim` - The claimed evaluation of the composite MLE at `eval_point`.
+///
+/// # Returns
+///
+/// A prover whose reduction emits the N column evaluations in the order given.
+///
+/// # Panics
+///
+/// Panics if any multilinear's variable count differs from `eval_point.len()`, or if `N == 0`.
+pub fn quadratic_mlecheck_prover<F, P, Composition, InfinityComposition, const N: usize>(
+	multilinears: [FieldBuffer<P>; N],
+	composition: Composition,
+	infinity_composition: InfinityComposition,
+	eval_point: Vec<F>,
+	eval_claim: F,
+) -> SharedMleCheckProver<
+	'static,
+	F,
+	P,
+	QuadraticMleEvaluator<P, Composition, InfinityComposition, N>,
+>
+where
+	F: Field,
+	P: PackedField<Scalar = F>,
+	Composition: Fn([P; N]) -> P + Send + Sync,
+	InfinityComposition: Fn([P; N]) -> P + Send + Sync,
+{
+	let mut store = MleStore::new(eval_point.len());
+	// Hand each column to the store, which checks its variable count against the point length.
+	let cols = multilinears.map(|col| store.push_owned(col));
+	// Register the evaluation point's equality-indicator tracker once for the sole evaluator.
+	let eq_tracker = store.register_eq_tracker(&eval_point);
+	let evaluator =
+		QuadraticMleEvaluator::new(cols, eq_tracker, composition, infinity_composition, eval_claim);
+	SharedMleCheckProver::new(store, vec![evaluator], eval_point)
 }
 
 impl<F, P, Composition, InfinityComposition, const N: usize> RoundEvaluator<F, P>
@@ -186,4 +246,159 @@ where
 enum RoundCoeffsOrEval<F: Field> {
 	Coeffs(RoundCoeffs<F>),
 	Eval(F),
+}
+
+#[cfg(test)]
+mod tests {
+	use std::{array, iter};
+
+	use binius_field::{Random, arch::OptimalPackedB128, field::FieldOps};
+	use binius_ip::mlecheck;
+	use binius_math::{
+		multilinear::evaluate::evaluate,
+		test_utils::{random_field_buffer, random_scalars},
+	};
+	use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
+	use itertools::Itertools;
+	use rand::prelude::*;
+
+	use super::*;
+	use crate::sumcheck::{common::SumcheckProver, prove_single_mlecheck};
+
+	type StdChallenger = HasherChallenger<sha2::Sha256>;
+
+	// Prove one quadratic MLE-check via the shared store, then verify it through the verifier.
+	// The verifier's reduced evaluation must equal the composition of the recovered column evals.
+	// Each column must evaluate to its claimed value at the challenge point.
+	// Prover and verifier challenges must agree.
+	fn prove_verify<F, P, const N: usize>(
+		composition: impl Fn([P; N]) -> P + Clone + Send + Sync,
+		infinity_composition: impl Fn([P; N]) -> P + Send + Sync,
+	) where
+		F: Field,
+		P: PackedField<Scalar = F>,
+	{
+		let n_vars = 8;
+		let mut rng = StdRng::seed_from_u64(0);
+
+		let multilinears: [_; N] = array::from_fn(|_| random_field_buffer::<P>(&mut rng, n_vars));
+
+		// The honest claim is the composite MLE evaluated at the point.
+		let composite_vals = (0..1 << n_vars.saturating_sub(P::LOG_WIDTH))
+			.map(|i| composition(array::from_fn(|j| multilinears[j].as_ref()[i])))
+			.collect_vec();
+		let composite_vals = FieldBuffer::new(n_vars, composite_vals);
+		let eval_point = random_scalars::<F>(&mut rng, n_vars);
+		let eval_claim = evaluate(&composite_vals, &eval_point);
+
+		let prover = quadratic_mlecheck_prover(
+			multilinears.clone(),
+			composition.clone(),
+			infinity_composition,
+			eval_point.clone(),
+			eval_claim,
+		);
+
+		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+		let output = prove_single_mlecheck(prover, &mut prover_transcript);
+		prover_transcript
+			.message()
+			.write_slice(&output.multilinear_evals);
+
+		let mut verifier_transcript = prover_transcript.into_verifier();
+		let sumcheck_output = mlecheck::verify(
+			&eval_point,
+			2, // quadratic compositions have degree-2 round polynomials
+			eval_claim,
+			&mut verifier_transcript,
+		)
+		.unwrap();
+
+		// The prover binds variables high-to-low.
+		// `evaluate` expects them low-to-high, so reverse the challenges.
+		let mut reduced_eval_point = sumcheck_output.challenges.clone();
+		reduced_eval_point.reverse();
+
+		let multilinear_evals: Vec<F> = verifier_transcript.message().read_vec(N).unwrap();
+
+		// The reduced evaluation is the composition of the column evaluations.
+		let evals_packed: [P; N] = array::from_fn(|i| P::broadcast(multilinear_evals[i]));
+		assert_eq!(
+			composition(evals_packed).iter().next().unwrap(),
+			sumcheck_output.eval,
+			"composition of the column evaluations should equal the reduced evaluation"
+		);
+
+		// Each column evaluates to its claimed value at the challenge point.
+		for (multilinear, claimed_eval) in iter::zip(&multilinears, multilinear_evals) {
+			assert_eq!(evaluate(multilinear, &reduced_eval_point), claimed_eval);
+		}
+
+		assert_eq!(
+			output.challenges, sumcheck_output.challenges,
+			"prover and verifier challenges should match"
+		);
+	}
+
+	#[test]
+	fn test_linear_mlecheck() {
+		prove_verify::<_, OptimalPackedB128, 2>(
+			|[a, b]| a + b,
+			|[_a, _b]| OptimalPackedB128::zero(),
+		);
+	}
+
+	#[test]
+	fn test_bivariate_product_mlecheck() {
+		prove_verify::<_, OptimalPackedB128, 2>(|[a, b]| a * b, |[a, b]| a * b);
+	}
+
+	#[test]
+	fn test_mul_gate_mlecheck() {
+		prove_verify::<_, OptimalPackedB128, 3>(|[a, b, c]| a * b - c, |[a, b, _c]| a * b);
+	}
+
+	#[test]
+	fn test_4_variate_composition_mlecheck() {
+		prove_verify::<_, OptimalPackedB128, 4>(
+			|[a, b, c, d]| (a + b) * (c + d),
+			|[a, b, c, d]| (a + b) * (c + d),
+		);
+	}
+
+	#[test]
+	fn test_round_claim_lerp_recovery() {
+		type P = OptimalPackedB128;
+		type F = <P as FieldOps>::Scalar;
+
+		let n_vars = 8;
+		let mut rng = StdRng::seed_from_u64(0);
+
+		let multilinears: [_; 2] = array::from_fn(|_| random_field_buffer::<P>(&mut rng, n_vars));
+		let composition = |[a, b]: [P; 2]| a * b;
+		let composite_vals = (0..1 << n_vars.saturating_sub(P::LOG_WIDTH))
+			.map(|i| composition(array::from_fn(|j| multilinears[j].as_ref()[i])))
+			.collect_vec();
+		let composite_vals = FieldBuffer::new(n_vars, composite_vals);
+		let eval_point = random_scalars::<F>(&mut rng, n_vars);
+		let eval_claim = evaluate(&composite_vals, &eval_point);
+
+		let mut prover = quadratic_mlecheck_prover(
+			multilinears,
+			composition,
+			composition,
+			eval_point,
+			eval_claim,
+		);
+
+		let mut expected = vec![eval_claim];
+		for _ in 0..n_vars {
+			assert_eq!(prover.round_claim(), expected, "claim before execute");
+			let round = prover.execute();
+			assert_eq!(prover.round_claim(), expected, "claim recovered from coeffs");
+			let challenge = F::random(&mut rng);
+			expected = round.iter().map(|r| r.evaluate(challenge)).collect();
+			prover.fold(challenge);
+		}
+	}
 }

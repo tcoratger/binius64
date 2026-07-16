@@ -12,8 +12,7 @@ use binius_field::{
 use binius_ip_prover::{
 	channel::IPProverChannel,
 	sumcheck::{
-		ProveSingleOutput, common::MleCheckProver, prove_single_mlecheck,
-		quadratic_mle::QuadraticMleCheckProver,
+		ProveSingleOutput, common::MleCheckProver, prove_single_mlecheck, quadratic_mlecheck_prover,
 	},
 };
 use binius_math::{
@@ -144,7 +143,7 @@ where
 	///
 	/// # Returns
 	///
-	/// Returns an `QuadraticMleCheckProver` configured to prove the sumcheck claim:
+	/// Returns an MLE-check prover configured to prove the sumcheck claim:
 	/// R₀(z) = ∑_{X₀,...,Xₙ₋₁ ∈ {0,1}} (A(z,X₀,...,Xₙ₋₁)·B(z,X₀,...,Xₙ₋₁) -
 	/// C(z,X₀,...,Xₙ₋₁))·eq(X₀,...,Xₙ₋₁; r₀,...,rₙ₋₁)
 	///
@@ -184,7 +183,7 @@ where
 		first_round_message_coeffs[ROWS_PER_HYPERCUBE_VERTEX..2 * ROWS_PER_HYPERCUBE_VERTEX]
 			.copy_from_slice(&self.univariate_round_message);
 
-		QuadraticMleCheckProver::new(
+		quadratic_mlecheck_prover(
 			proving_polys,
 			|[a, b, c]| a * b - c,
 			|[a, b, _]| a * b,

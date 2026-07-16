@@ -42,7 +42,7 @@ use binius_hash::binary_merkle_tree::HashSuite;
 use binius_iop_prover::{basefold_compiler::BaseFoldProverCompiler, channel::IOPProverChannel};
 use binius_ip_prover::{
 	channel::IPProverChannel,
-	sumcheck::{quadratic_mle::QuadraticMleCheckProver, zk_mlecheck},
+	sumcheck::{quadratic_mlecheck_prover, zk_mlecheck},
 };
 use binius_math::{
 	FieldBuffer, FieldSlice,
@@ -422,8 +422,8 @@ where
 	// Sample random evaluation point for mulcheck
 	let r_mulcheck = channel.sample_many(mask.n_vars());
 
-	// Create the QuadraticMleCheckProver for the mul gate: a * b - c
-	let mlecheck_prover = QuadraticMleCheckProver::new(
+	// Prove the mul-gate zerocheck a * b - c = 0 over the shared store.
+	let mlecheck_prover = quadratic_mlecheck_prover(
 		[mulcheck_witness.a, mulcheck_witness.b, mulcheck_witness.c],
 		|[a, b, c]| a * b - c, // composition
 		|[a, b, _c]| a * b,    // infinity_composition (quadratic term only)

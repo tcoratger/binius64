@@ -95,7 +95,6 @@ where
 		claim: MultilinearEvalClaim<F>,
 	) -> (impl MleCheckProver<F>, Option<Self>) {
 		let layer = self.layers.pop().expect("layers is non-empty");
-		let split = layer.split_half();
 
 		let remaining = if self.layers.is_empty() {
 			None
@@ -103,7 +102,10 @@ where
 			Some(self)
 		};
 
-		let prover = bivariate_product_mle::new(split, claim.point, claim.eval);
+		// The layer has one more variable than the claim point.
+		// Its low and high halves are the two multilinears whose product this layer reduces.
+		// Sharing the buffer between the halves avoids copying this (largest) layer.
+		let prover = bivariate_product_mle::new_split_half(layer, claim.point, claim.eval);
 
 		(prover, remaining)
 	}

@@ -639,12 +639,30 @@ fn test_zero_constant_not_in_binius64_operands() {
 			}
 		}
 	}
-	for constraint in &cs.mul_constraints {
+	for constraint in &cs.imul_constraints {
 		for operand in [&constraint.a, &constraint.b, &constraint.hi, &constraint.lo] {
 			for term in operand {
 				assert!(
 					!zero_const_indices.contains(&(term.value_index.0 as usize)),
-					"zero constant at ValueIndex({}) found in MUL operand",
+					"zero constant at ValueIndex({}) found in IMUL operand",
+					term.value_index.0
+				);
+			}
+		}
+	}
+	for constraint in &cs.bmul_constraints {
+		for operand in [
+			&constraint.a_lo,
+			&constraint.a_hi,
+			&constraint.b_lo,
+			&constraint.b_hi,
+			&constraint.c_lo,
+			&constraint.c_hi,
+		] {
+			for term in operand {
+				assert!(
+					!zero_const_indices.contains(&(term.value_index.0 as usize)),
+					"zero constant at ValueIndex({}) found in BMUL operand",
 					term.value_index.0
 				);
 			}

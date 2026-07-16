@@ -343,29 +343,29 @@ where
 	}
 }
 
-// Differential equivalence tests: identical claims run through the pre-store provers and the
-// store + evaluator path, asserting byte-identical round polynomials, challenges, and emitted
-// evaluations.
+// Prove-and-verify coverage for the shared store provers: a batched fractional-addition MLE-check,
+// and the logUp* final-layer shape (eq-weighted fractional addition batched with plain product
+// claims over shared columns).
 #[cfg(test)]
 mod tests {
-	use binius_field::{FieldOps, Random};
+	use binius_field::FieldOps;
+	use binius_ip::sumcheck::{batch_verify, batch_verify_mle};
 	use binius_math::{
 		FieldBuffer,
 		inner_product::inner_product_par,
-		multilinear::evaluate::evaluate,
+		multilinear::{eq::eq_ind, evaluate::evaluate},
 		test_utils::{Packed128b, random_field_buffer, random_scalars},
+		univariate::evaluate_univariate,
 	};
 	use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
-	use either::Either;
 	use rand::prelude::*;
 
 	use super::*;
 	use crate::sumcheck::{
-		MleToSumCheckDecorator, MleToSumCheckEvaluator,
+		MleToSumCheckEvaluator,
 		batch::{batch_prove, batch_prove_mle},
-		bivariate_product_evaluator::{BivariateProductEvaluator, bivariate_product_prover},
+		bivariate_product_evaluator::BivariateProductEvaluator,
 		frac_add_mle,
-		quadratic_mle::QuadraticMleCheckProver,
 	};
 
 	type P = Packed128b;
@@ -398,6 +398,7 @@ mod tests {
 			std::array::from_fn(|_| random_field_buffer::<P>(&mut *rng, n_vars));
 		let eval_point = random_scalars::<F>(&mut *rng, n_vars);
 
+		// The honest claim is each composition's MLE evaluated at the point.
 		let claims = [comp_num as CompFn, comp_den as CompFn].map(|comp| {
 			let vals = (0..1usize << n_vars)
 				.map(|i| {
@@ -419,22 +420,8 @@ mod tests {
 		(cols, eval_point, claims)
 	}
 
-	// The pre-store single-claim provers for the two fractional-addition compositions.
-	fn old_frac_provers(
-		cols: &[FieldBuffer<P>; 4],
-		eval_point: &[F],
-		claims: [F; 2],
-	) -> [QuadraticMleCheckProver<P, CompFn, CompFn, 4>; 2] {
-		[
-			(comp_num as CompFn, claims[0]),
-			(comp_den as CompFn, claims[1]),
-		]
-		.map(|(comp, claim)| {
-			QuadraticMleCheckProver::new(cols.clone(), comp, comp, eval_point.to_vec(), claim)
-		})
-	}
-
-	// The store + evaluator path for the same claims, with borrowed columns.
+	// The store + evaluator MLE-check prover for the two fractional-addition claims, borrowing the
+	// four shared columns.
 	fn new_frac_prover<'a>(
 		cols: &'a [FieldBuffer<P>; 4],
 		eval_point: &[F],
@@ -449,102 +436,72 @@ mod tests {
 		SharedMleCheckProver::new(store, evaluators, eval_point.to_vec())
 	}
 
-	// Lockstep comparison against the surviving single-claim provers: round claims, round
-	// polynomials, evaluation points, and final evaluations must all match exactly.
+	// Prove the two fractional-addition claims through the MLE-check batch driver, then verify.
+	// The two claims share one store, so the four columns are folded and evaluated once.
 	#[test]
-	fn test_shared_frac_add_matches_single_provers_lockstep() {
+	fn test_shared_frac_add_prove_verify() {
 		for n_vars in [1, 2, 3, 8] {
 			let mut rng = StdRng::seed_from_u64(0);
 			let (cols, eval_point, claims) = frac_instance(&mut rng, n_vars);
 
-			let [mut old_num, mut old_den] = old_frac_provers(&cols, &eval_point, claims);
-			let mut shared = new_frac_prover(&cols, &eval_point, claims);
+			// Prove: one shared prover carries both claims over the four columns.
+			let mut transcript = ProverTranscript::new(StdChallenger::default());
+			let output =
+				batch_prove_mle(vec![new_frac_prover(&cols, &eval_point, claims)], &mut transcript);
 
-			for _round in 0..n_vars {
-				assert_eq!(
-					shared.round_claim(),
-					[old_num.round_claim(), old_den.round_claim()].concat(),
-					"round claims must match before execute (n_vars={n_vars})"
-				);
-				assert_eq!(shared.eval_point(), old_num.eval_point());
+			// The shared prover emits the four column evaluations once, in push order.
+			assert_eq!(output.multilinear_evals.len(), 1);
+			let evals = output.multilinear_evals[0].clone();
+			assert_eq!(evals.len(), 4);
+			transcript.message().write_scalar_slice(&evals);
 
-				let new_coeffs = shared.execute();
-				let old_coeffs = [old_num.execute(), old_den.execute()].concat();
-				assert_eq!(
-					new_coeffs, old_coeffs,
-					"round polynomials must match (n_vars={n_vars})"
-				);
+			// Verify: quadratic prime polynomials give degree-2 MLE-check rounds.
+			let mut verifier = transcript.into_verifier();
+			let sumcheck_output = batch_verify_mle(&eval_point, 2, &claims, &mut verifier).unwrap();
+			let verified_evals: Vec<F> = verifier.message().read_vec(4).unwrap();
+			assert_eq!(evals, verified_evals, "prover and verifier column evaluations must match");
 
-				assert_eq!(
-					shared.round_claim(),
-					[old_num.round_claim(), old_den.round_claim()].concat(),
-					"round claims must match after execute (n_vars={n_vars})"
-				);
+			// The prover binds variables high-to-low; `evaluate` expects them low-to-high.
+			let mut point = sumcheck_output.challenges.clone();
+			point.reverse();
 
-				let challenge = F::random(&mut rng);
-				shared.fold(challenge);
-				old_num.fold(challenge);
-				old_den.fold(challenge);
+			// Each recovered column evaluation is the column's evaluation at the challenge point.
+			for (col, &eval) in cols.iter().zip(&verified_evals) {
+				assert_eq!(evaluate(col, &point), eval);
 			}
 
-			let old_evals = old_num.finish();
-			assert_eq!(old_den.finish(), old_evals);
-			assert_eq!(
-				shared.finish(),
-				old_evals,
-				"final evaluations must match (n_vars={n_vars})"
-			);
+			// The reduced evaluation is the batch combination of the two compositions at the evals.
+			let packed = std::array::from_fn(|i| P::broadcast(verified_evals[i]));
+			let composed = [comp_num, comp_den]
+				.map(|comp| comp(packed).iter().next().expect("packed field has a lane"));
+			let expected = evaluate_univariate(&composed, sumcheck_output.batch_coeff);
+			assert_eq!(expected, sumcheck_output.eval, "reduced evaluation must match the batch");
+
+			// Prover challenges, reversed, match the verifier's.
+			let mut prover_challenges = output.challenges.clone();
+			prover_challenges.reverse();
+			assert_eq!(prover_challenges, sumcheck_output.challenges);
 		}
 	}
 
-	// Full-transcript comparison through the MLE-check batch driver: the store path must produce
-	// byte-identical transcripts to the pre-store provers.
+	// The logUp* final-layer shape: an eq-weighted fractional addition (two claims) batched with
+	// two plain product claims, all sharing the pushforward halves in one store. Prove through the
+	// sumcheck batch driver, then verify the reduced evaluation against the batched compositions.
 	#[test]
-	fn test_shared_frac_add_transcript_matches_single_provers() {
-		for n_vars in [1, 3, 8] {
-			let mut rng = StdRng::seed_from_u64(0);
-			let (cols, eval_point, claims) = frac_instance(&mut rng, n_vars);
-
-			let mut old_transcript = ProverTranscript::new(StdChallenger::default());
-			let old_output = batch_prove_mle(
-				Vec::from(old_frac_provers(&cols, &eval_point, claims)),
-				&mut old_transcript,
-			);
-
-			let mut new_transcript = ProverTranscript::new(StdChallenger::default());
-			let new_output = batch_prove_mle(
-				vec![new_frac_prover(&cols, &eval_point, claims)],
-				&mut new_transcript,
-			);
-
-			assert_eq!(old_output.challenges, new_output.challenges);
-			// Both single provers evaluate all four shared columns; the store path emits the
-			// per-claim-group evaluations of its one evaluator.
-			assert_eq!(old_output.multilinear_evals[1], old_output.multilinear_evals[0]);
-			assert_eq!(new_output.multilinear_evals, vec![old_output.multilinear_evals[0].clone()]);
-			assert_eq!(
-				old_transcript.finalize(),
-				new_transcript.finalize(),
-				"transcripts must be byte-identical (n_vars={n_vars})"
-			);
-		}
-	}
-
-	// Full-transcript comparison of the logUp* final-layer shape: an eq-weighted fractional
-	// addition batched with two plain product claims, sharing the pushforward columns.
-	#[test]
-	fn test_shared_final_layer_transcript_matches_old_provers() {
+	fn test_shared_final_layer_prove_verify() {
 		for m in [1, 2, 3, 6] {
 			let mut rng = StdRng::seed_from_u64(0);
 
+			// Three parent buffers of m variables; each splits into two m-1 variable halves.
 			let pushforward = random_field_buffer::<P>(&mut rng, m);
 			let denominator = random_field_buffer::<P>(&mut rng, m);
 			let table = random_field_buffer::<P>(&mut rng, m);
-
 			let [y_0, y_1] = owned_halves(&pushforward);
 			let [d_0, d_1] = owned_halves(&denominator);
 			let [t_0, t_1] = owned_halves(&table);
 
+			// Fractional claims at z; product claims are the inner products of the pushforward and
+			// table halves.
 			let z = random_scalars::<F>(&mut rng, m - 1);
 			let frac_claims: [F; 2] = [comp_num as CompFn, comp_den as CompFn].map(|comp| {
 				let vals = (0..1usize << (m - 1))
@@ -561,36 +518,27 @@ mod tests {
 			let e_0 = inner_product_par(&y_0, &t_0);
 			let e_1 = inner_product_par(&y_1, &t_1);
 
-			// Old path: a decorated MLE-check prover per fractional claim and a standalone
-			// product prover per product claim, each on its own copies of the shared columns.
-			let frac_cols = [y_0.clone(), y_1.clone(), d_0.clone(), d_1.clone()];
-			let [old_num, old_den] = old_frac_provers(&frac_cols, &z, frac_claims);
-			let old_provers = vec![
-				Either::Left(MleToSumCheckDecorator::new(old_num)),
-				Either::Left(MleToSumCheckDecorator::new(old_den)),
-				Either::Right(bivariate_product_prover([y_0.clone(), t_0.clone()], e_0)),
-				Either::Right(bivariate_product_prover([y_1.clone(), t_1.clone()], e_1)),
-			];
-			let mut old_transcript = ProverTranscript::new(StdChallenger::default());
-			let old_output = batch_prove(old_provers, &mut old_transcript);
-
-			// New path: one store with six borrowed columns, folded once each.
+			// One store with six borrowed columns, in push order [Y_0, Y_1, D_0, D_1, T_0, T_1].
 			let mut store = MleStore::new(m - 1);
 			let [y_0_col, y_1_col, d_0_col, d_1_col, t_0_col, t_1_col] =
 				[&y_0, &y_1, &d_0, &d_1, &t_0, &t_1].map(|col| store.push(col.to_ref()));
+
+			// The eq-weighted fractional evaluators, wrapped so they emit sumcheck round
+			// polynomials.
 			let (num_evaluator, den_evaluator) = frac_add_mle::evaluators(
 				&mut store,
 				[y_0_col, y_1_col, d_0_col, d_1_col],
 				z.to_vec(),
 				frac_claims,
 			);
-			// The fractional evaluators share z's eq tracker; recover its id for the sumcheck
-			// wrappers, which read the round's alpha and equality prefix from the store.
 			let eq_tracker = store.register_eq_tracker(&z);
 			let num_evaluator = MleToSumCheckEvaluator::new(num_evaluator, eq_tracker);
 			let den_evaluator = MleToSumCheckEvaluator::new(den_evaluator, eq_tracker);
+
+			// The two plain product claims over the pushforward and table halves.
 			let product_0 = BivariateProductEvaluator::new([y_0_col, t_0_col], e_0);
 			let product_1 = BivariateProductEvaluator::new([y_1_col, t_1_col], e_1);
+
 			let evaluators: Vec<Box<dyn RoundEvaluator<F, P>>> = vec![
 				Box::new(num_evaluator),
 				Box::new(den_evaluator),
@@ -598,29 +546,51 @@ mod tests {
 				Box::new(product_1),
 			];
 			let shared = SharedSumcheckProver::new(store, evaluators);
-			let mut new_transcript = ProverTranscript::new(StdChallenger::default());
-			let new_output = batch_prove(vec![shared], &mut new_transcript);
 
-			assert_eq!(old_output.challenges, new_output.challenges);
+			// Prove and record the four claim sums in evaluator order.
+			let mut transcript = ProverTranscript::new(StdChallenger::default());
+			let output = batch_prove(vec![shared], &mut transcript);
 
-			// The shared prover emits each store column's evaluation once, in push order
-			// [Y_0, Y_1, D_0, D_1, T_0, T_1] — no per-claim duplication of the shared columns.
-			let new_evals = &new_output.multilinear_evals[0];
-			assert_eq!(new_evals.len(), 6);
-			// Y_0, Y_1, D_0, D_1 match the fractional provers' shared columns.
-			assert_eq!(new_evals[..4], old_output.multilinear_evals[0][..]);
-			assert_eq!(old_output.multilinear_evals[1], old_output.multilinear_evals[0]);
-			// The product provers evaluate [Y_half, T_half]; T_0, T_1 are their second evaluations.
-			assert_eq!(new_evals[0], old_output.multilinear_evals[2][0]);
-			assert_eq!(new_evals[4], old_output.multilinear_evals[2][1]);
-			assert_eq!(new_evals[1], old_output.multilinear_evals[3][0]);
-			assert_eq!(new_evals[5], old_output.multilinear_evals[3][1]);
+			// The shared prover emits each store column's evaluation once, in push order.
+			assert_eq!(output.multilinear_evals.len(), 1);
+			let evals = output.multilinear_evals[0].clone();
+			assert_eq!(evals.len(), 6);
+			transcript.message().write_scalar_slice(&evals);
 
-			assert_eq!(
-				old_transcript.finalize(),
-				new_transcript.finalize(),
-				"transcripts must be byte-identical (m={m})"
-			);
+			// Verify: the eq-wrapped fractional rounds have degree 3, the product rounds degree 2,
+			// so the batched round polynomial has degree 3.
+			let claims = [frac_claims[0], frac_claims[1], e_0, e_1];
+			let mut verifier = transcript.into_verifier();
+			let sumcheck_output = batch_verify(m - 1, 3, &claims, &mut verifier).unwrap();
+			let verified_evals: Vec<F> = verifier.message().read_vec(6).unwrap();
+			assert_eq!(evals, verified_evals, "prover and verifier column evaluations must match");
+
+			// The prover binds variables high-to-low; `evaluate` expects them low-to-high.
+			let mut point = sumcheck_output.challenges.clone();
+			point.reverse();
+
+			// Each recovered column evaluation is the column's evaluation at the challenge point.
+			for (col, &eval) in [&y_0, &y_1, &d_0, &d_1, &t_0, &t_1]
+				.iter()
+				.zip(&verified_evals)
+			{
+				assert_eq!(evaluate(col, &point), eval);
+			}
+
+			// The reduced evaluation batches the four claims' reduced compositions in evaluator
+			// order. The fractional compositions carry the equality factor at z; the products do
+			// not.
+			let [y0, y1, d0, d1, t0, t1] =
+				<[F; 6]>::try_from(verified_evals).expect("six column evaluations");
+			let eq = eq_ind(&z, &point);
+			let reduced = [(y0 * d1 + y1 * d0) * eq, (d0 * d1) * eq, y0 * t0, y1 * t1];
+			let expected = evaluate_univariate(&reduced, sumcheck_output.batch_coeff);
+			assert_eq!(expected, sumcheck_output.eval, "reduced evaluation must match the batch");
+
+			// Prover challenges, reversed, match the verifier's.
+			let mut prover_challenges = output.challenges.clone();
+			prover_challenges.reverse();
+			assert_eq!(prover_challenges, sumcheck_output.challenges);
 		}
 	}
 }

@@ -1,9 +1,9 @@
 // Copyright 2025 Irreducible Inc.
 // Copyright 2026 The Binius Developers
 
-use binius_circuits::sha256::Sha256;
+use binius_circuits::{fixed_byte_vec::ByteVec, sha256::sha256_varlen};
 use binius_core::{
-	constraint_system::{AndConstraint, ConstraintSystem, MulConstraint, ValueVec},
+	constraint_system::{AndConstraint, ConstraintSystem, ImulConstraint, ValueVec},
 	verify::verify_constraints,
 	word::Word,
 };
@@ -41,25 +41,31 @@ pub fn create_sha256_cs_with_witness() -> (ConstraintSystem, ValueVec) {
 		builder.add_inout(),
 		builder.add_inout(),
 	];
-	let message: Vec<Wire> = (0..max_len.div_ceil(8))
+	let data: Vec<Wire> = (0..max_len.div_ceil(8))
 		.map(|_| builder.add_witness())
 		.collect();
 
 	// Create the SHA256 circuit
-	let sha256 = Sha256::new(&builder, len, digest, message);
+	let message = ByteVec::new(data, len);
+	let computed = sha256_varlen(&builder, &message);
+	for i in 0..4 {
+		builder.assert_eq(format!("digest[{i}]"), computed[i], digest[i]);
+	}
 
 	let circuit = builder.build();
 	let mut witness_filler = circuit.new_witness_filler();
 
 	// Populate with concrete message: "abc"
 	let message_bytes = b"abc";
-	sha256.populate_len_bytes(&mut witness_filler, message_bytes.len());
-	sha256.populate_message(&mut witness_filler, message_bytes);
+	message.populate_len_bytes(&mut witness_filler, message_bytes.len());
+	message.populate_data(&mut witness_filler, message_bytes);
 
 	// Calculate SHA256 digest of the message dynamically
 	let hash = Sha256Hasher::digest(message_bytes);
 	let expected_digest: [u8; 32] = hash.into();
-	sha256.populate_digest(&mut witness_filler, expected_digest);
+	for (i, chunk) in expected_digest.chunks(8).enumerate() {
+		witness_filler[digest[i]] = Word(u64::from_be_bytes(chunk.try_into().unwrap()));
+	}
 
 	// Get the witness vector
 	circuit.populate_wire_witness(&mut witness_filler).unwrap();
@@ -144,8 +150,8 @@ pub fn compute_bitand_images(constraints: &[AndConstraint], witness: &ValueVec) 
 	[a_image, b_image, c_image]
 }
 
-// Compute the image of the witness applied to the MUL constraints
-fn compute_intmul_images(constraints: &[MulConstraint], witness: &ValueVec) -> [Vec<Word>; 4] {
+// Compute the image of the witness applied to the IMUL constraints
+fn compute_intmul_images(constraints: &[ImulConstraint], witness: &ValueVec) -> [Vec<Word>; 4] {
 	let (a_image, b_image, hi_image, lo_image) = constraints
 		.iter()
 		.map(|constraint| {
@@ -159,7 +165,7 @@ fn compute_intmul_images(constraints: &[MulConstraint], witness: &ValueVec) -> [
 	[a_image, b_image, hi_image, lo_image]
 }
 
-// Evaluate the image of the witness applied to the AND or MUL constraints
+// Evaluate the image of the witness applied to the AND or IMUL constraints
 // Univariate point is `r_zhat_prime`, multilinear point tensor-expanded is `r_x_prime_tensor`
 fn evaluate_image<F: BinaryField>(
 	subspace: &BinarySubspace<F>,
@@ -219,14 +225,15 @@ fn test_shift_prove_and_verify() {
 				.map(F::new)
 				.collect::<Vec<_>>()
 		};
-		// A constraint system may have zero MUL constraints (e.g. a pure-AND circuit like SHA-256).
-		// The IntMul operator is then empty — an empty challenge point and a zero claim — mirroring
-		// the prover/verifier skip of the IntMul reduction in `binius_prover` / `binius_verifier`.
-		let intmul_is_empty = cs.mul_constraints.is_empty();
+		// A constraint system may have zero IMUL constraints (e.g. a pure-AND circuit like
+		// SHA-256). The IntMul operator is then empty — an empty challenge point and a zero claim
+		// — mirroring the prover/verifier skip of the IntMul reduction in `binius_prover` /
+		// `binius_verifier`.
+		let intmul_is_empty = cs.imul_constraints.is_empty();
 		let r_x_prime_intmul = if intmul_is_empty {
 			Vec::new()
 		} else {
-			let log_intmul_constraint_count = strict_log_2(cs.mul_constraints.len()).unwrap();
+			let log_intmul_constraint_count = strict_log_2(cs.imul_constraints.len()).unwrap();
 			(0..log_intmul_constraint_count as u128)
 				.map(F::new)
 				.collect::<Vec<_>>()
@@ -250,7 +257,7 @@ fn test_shift_prove_and_verify() {
 		let intmul_evals: [F; 4] = if intmul_is_empty {
 			[F::ZERO; 4]
 		} else {
-			compute_intmul_images(&cs.mul_constraints, &value_vec).map(|image| {
+			compute_intmul_images(&cs.imul_constraints, &value_vec).map(|image| {
 				evaluate_image(
 					&subspace,
 					&image,

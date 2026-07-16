@@ -1,7 +1,7 @@
 // Copyright 2025 Irreducible Inc.
 
 use binius_field::{arch::OptimalPackedB128, packed::PackedField};
-use binius_ip_prover::sumcheck::{prove_single_mlecheck, quadratic_mle::QuadraticMleCheckProver};
+use binius_ip_prover::sumcheck::{prove_single_mlecheck, quadratic_mlecheck_prover};
 use binius_math::{
 	inner_product::inner_product_par,
 	test_utils::{random_field_buffer, random_scalars},
@@ -36,7 +36,7 @@ fn bench_mlecheck_prove(c: &mut Criterion) {
 			b.iter_batched(
 				|| [multilinear_a.clone(), multilinear_b.clone()],
 				|multilinears| {
-					let prover = QuadraticMleCheckProver::new(
+					let prover = quadratic_mlecheck_prover(
 						multilinears,
 						|[a, b]| a * b,
 						|[a, b]| a * b,
@@ -78,7 +78,7 @@ fn bench_mlecheck_prove(c: &mut Criterion) {
 					]
 				},
 				|multilinears| {
-					let prover = QuadraticMleCheckProver::new(
+					let prover = quadratic_mlecheck_prover(
 						multilinears,
 						|[a, b, c]| a * b - c,
 						|[a, b, _c]| a * b,

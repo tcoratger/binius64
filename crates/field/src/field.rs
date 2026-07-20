@@ -76,7 +76,7 @@ pub trait Field:
 ///
 /// This trait abstracts over:
 /// - [`Field`] types (single field elements, which are trivially vectors of length 1)
-/// - [`PackedField`](crate::PackedField) types (SIMD-accelerated vectors of field elements)
+/// - [`PackedField`] types (SIMD-accelerated vectors of field elements)
 /// - Symbolic field types (for constraint system representations)
 ///
 /// Mathematically, instances of this trait represent vectors of field elements where

@@ -11,16 +11,13 @@ use binius_utils::{
 	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
 	bytes::{Buf, BufMut},
 };
-use bytemuck::{Pod, Zeroable};
+use bytemuck::Pod;
 
 use super::{
-	arithmetic_traits::InvertOrZero,
 	binary_field::{BinaryField, BinaryField1b, binary_field, impl_field_extension},
 	mul_by_binary_field_1b,
 };
-use crate::{
-	ExtensionField, Field, binary_field_arithmetic::impl_arithmetic_using_packed, underlier::U1,
-};
+use crate::{ExtensionField, Field, underlier::U1};
 
 // These fields represent a tower based on AES GF(2^8) field (GF(256)/x^8+x^4+x^3+x+1)
 // that is isomorphically included into binary tower, i.e.:
@@ -33,7 +30,7 @@ binary_field!(pub AESTowerField8b(u8), 0xD0);
 
 impl AESTowerField8b {
 	pub const fn new(value: u8) -> Self {
-		Self(value)
+		Self::from_raw(value)
 	}
 }
 
@@ -121,8 +118,6 @@ unsafe impl Pod for AESTowerField8b {}
 impl_field_extension!(BinaryField1b(U1) < @3 => AESTowerField8b(u8));
 
 mul_by_binary_field_1b!(AESTowerField8b);
-
-impl_arithmetic_using_packed!(AESTowerField8b);
 
 impl SerializeBytes for AESTowerField8b {
 	fn serialize(&self, write_buf: impl BufMut) -> Result<(), SerializationError> {

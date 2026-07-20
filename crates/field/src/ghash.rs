@@ -14,7 +14,7 @@ use binius_utils::{
 	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
 	bytes::{Buf, BufMut},
 };
-use bytemuck::{Pod, TransparentWrapper, Zeroable};
+use bytemuck::Pod;
 
 use super::{
 	binary_field::{BinaryField, BinaryField1b, binary_field, impl_field_extension},
@@ -22,9 +22,7 @@ use super::{
 };
 use crate::{
 	AESTowerField8b, Field, PackedBinaryGhash1x128b, WideMul,
-	arch::{GhashWideMul1x, M128, invert_b128},
-	arithmetic_traits::{InvertOrZero, Square},
-	binary_field_arithmetic::square_using_packed,
+	arch::M128,
 	mul_by_binary_field_1b,
 	underlier::{U1, WithUnderlier},
 };
@@ -36,43 +34,28 @@ binary_field!(pub BinaryField128bGhash(M128), M128::from_u128(0x494ef99794d5244f
 // is a distinct type from `u128` on every target, so these never collide with the macro's impls.
 impl From<u128> for BinaryField128bGhash {
 	fn from(value: u128) -> Self {
-		Self(M128::from(value))
+		Self::from_raw(M128::from(value))
 	}
 }
 
 impl From<BinaryField128bGhash> for u128 {
 	fn from(value: BinaryField128bGhash) -> Self {
-		value.0.into()
+		value.val().into()
 	}
 }
 
-// Deferred-reduction widening multiply via the optimal `GhashWideMul` wrapper applied to the
-// width-1 `PackedBinaryGhash1x128b` packing. The scalar and the packing share the `M128` underlier,
-// so the conversions are zero-cost reinterprets.
-//
-// This routes the scalar through the packed type's wrapper rather than wrapping the scalar
-// directly. It relies on every M128 GHASH packing using a deferring wrapper whose `Output` is a
-// concrete `WideGhashProduct` (not the packed type itself): `WideMul` is a supertrait of both
-// `Field` and `PackedField`, and `BinaryField128bGhash` is the `Scalar` of
-// `PackedBinaryGhash1x128b`, so a `TrivialWideMul` fallback (whose `Output` is the packed type,
-// bounded `Add + Mul`) would close a trait-resolution cycle through `Field: WideMul`.
+// The deferred-reduction widening multiply is inherited from the width-1 packing (`self.0`).
 impl WideMul for BinaryField128bGhash {
-	type Output = <GhashWideMul1x<PackedBinaryGhash1x128b> as WideMul>::Output;
+	type Output = <PackedBinaryGhash1x128b as WideMul>::Output;
 
 	#[inline]
 	fn wide_mul(a: Self, b: Self) -> Self::Output {
-		let a = PackedBinaryGhash1x128b::from_underlier(a.to_underlier());
-		let b = PackedBinaryGhash1x128b::from_underlier(b.to_underlier());
-		<GhashWideMul1x<PackedBinaryGhash1x128b> as WideMul>::wide_mul(
-			GhashWideMul1x::wrap(a),
-			GhashWideMul1x::wrap(b),
-		)
+		<PackedBinaryGhash1x128b as WideMul>::wide_mul(a.0, b.0)
 	}
 
 	#[inline]
 	fn reduce(wide: Self::Output) -> Self {
-		let reduced = <GhashWideMul1x<PackedBinaryGhash1x128b> as WideMul>::reduce(wide);
-		Self::from_underlier(GhashWideMul1x::peel(reduced).to_underlier())
+		Self(<PackedBinaryGhash1x128b as WideMul>::reduce(wide))
 	}
 }
 
@@ -82,7 +65,7 @@ impl BinaryField128bGhash {
 	/// Constructs an element from its `u128` value. The underlier is `M128`, but `u128` is the
 	/// ergonomic constructor type, so this converts.
 	pub const fn new(value: u128) -> Self {
-		Self(M128::from_u128(value))
+		Self::from_raw(M128::from_u128(value))
 	}
 
 	#[inline]
@@ -115,33 +98,6 @@ impl BinaryField128bGhash {
 		let result = shifted ^ (((1u128 << 127) | 0x43) & mask);
 
 		Self::new(result)
-	}
-}
-
-// Multiplication is `reduce(wide_mul)`, deferring to the scalar's own `WideMul` impl above (which
-// routes through the optimal `GhashWideMul` packing). This keeps the widening multiply as the
-// single source of truth for both `Mul` and `WideMul`.
-impl Mul<BinaryField128bGhash> for BinaryField128bGhash {
-	type Output = Self;
-
-	#[inline]
-	fn mul(self, rhs: Self) -> Self {
-		crate::tracing::trace_multiplication!(BinaryField128bGhash);
-		Self::reduce(Self::wide_mul(self, rhs))
-	}
-}
-
-impl Square for BinaryField128bGhash {
-	#[inline]
-	fn square(self) -> Self {
-		square_using_packed::<PackedBinaryGhash1x128b>(self)
-	}
-}
-
-impl InvertOrZero for BinaryField128bGhash {
-	#[inline]
-	fn invert_or_zero(self) -> Self {
-		invert_b128(self)
 	}
 }
 
@@ -432,7 +388,7 @@ impl From<AESTowerField8b> for BinaryField128bGhash {
 			0x71af641f08dbd1a0990483806bffbe0d,
 		];
 
-		BinaryField128bGhash::new(LOOKUP_TABLE[value.0 as usize])
+		BinaryField128bGhash::new(LOOKUP_TABLE[value.val() as usize])
 	}
 }
 
@@ -441,7 +397,10 @@ mod tests {
 	use proptest::{prelude::any, proptest};
 
 	use super::*;
-	use crate::{WideMul, binary_field::tests::is_binary_field_valid_generator};
+	use crate::{
+		WideMul, arithmetic_traits::InvertOrZero,
+		binary_field::tests::is_binary_field_valid_generator,
+	};
 
 	#[test]
 	fn test_ghash_mul() {

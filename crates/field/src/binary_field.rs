@@ -11,6 +11,7 @@ use binius_utils::{
 	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
 	bytes::{Buf, BufMut},
 };
+use bytemuck::Zeroable;
 
 use super::{UnderlierType, WithUnderlier, extension::ExtensionField};
 use crate::{Field, underlier::U1};
@@ -22,111 +23,29 @@ pub trait BinaryField:
 	const N_BITS: usize = Self::ORDER_EXPONENT;
 }
 
-/// Generates a binary field type — a newtype over an underlier `$typ`.
-///
-/// The default form wraps the field's width-one `PackedPrimitiveType` packing.
-/// `Mul`, `Square` and `InvertOrZero` are inherited from that packing.
-///
-/// The `direct` form wraps `$typ` itself and defines its own arithmetic.
-/// Use it for underliers with no reflexive `Divisible<Self>`, e.g. `GhashSq256b` over `M256`.
-///
-/// Both forms share the `@common` impls, written through `val`/`from_raw`.
+/// Macro to generate an implementation of a BinaryField.
 macro_rules! binary_field {
-	// Wrapped representation (default): newtype over the field's width-one packing.
 	($vis:vis $name:ident($typ:ty), $gen:expr) => {
-		binary_field!(@repr_wrapped $vis $name($typ));
-		binary_field!(@common $name($typ), $gen);
-	};
-	// Direct representation: newtype over the underlier; the field provides its own arithmetic.
-	(direct $vis:vis $name:ident($typ:ty), $gen:expr) => {
-		binary_field!(@repr_direct $vis $name($typ));
-		binary_field!(@common $name($typ), $gen);
-	};
-
-	(@repr_wrapped $vis:vis $name:ident($typ:ty)) => {
-		#[derive(Default, Clone, Copy, PartialEq, Eq, bytemuck::Zeroable)]
-		#[repr(transparent)]
-		$vis struct $name(pub(crate) $crate::arch::PackedPrimitiveType<$typ, $name>);
-
-		// Safety: `$name` and `$typ` share one layout, so `peel`/`wrap` may reinterpret between them.
-		//   $name --repr(transparent)--> PackedPrimitiveType --repr(transparent)--> $typ
-		unsafe impl ::bytemuck::TransparentWrapper<$typ> for $name {}
-
-		unsafe impl $crate::underlier::WithUnderlier for $name {
-			type Underlier = $typ;
-		}
-
-		impl $name {
-			/// Wraps a raw underlier value. `const` so the field constants can be built in a const
-			/// context.
-			#[inline]
-			pub(crate) const fn from_raw(val: $typ) -> Self {
-				Self($crate::arch::PackedPrimitiveType::from_underlier(val))
-			}
-
-			/// Returns the raw underlier value.
-			#[inline]
-			pub const fn val(self) -> $typ {
-				self.0.to_underlier()
-			}
-		}
-
-		impl Mul<Self> for $name {
-			type Output = Self;
-
-			#[inline]
-			fn mul(self, rhs: Self) -> Self {
-				$crate::tracing::trace_multiplication!($name);
-				Self(self.0 * rhs.0)
-			}
-		}
-
-		impl $crate::arithmetic_traits::Square for $name {
-			#[inline]
-			fn square(self) -> Self {
-				Self($crate::arithmetic_traits::Square::square(self.0))
-			}
-		}
-
-		impl $crate::arithmetic_traits::InvertOrZero for $name {
-			#[inline]
-			fn invert_or_zero(self) -> Self {
-				Self($crate::arithmetic_traits::InvertOrZero::invert_or_zero(self.0))
-			}
-		}
-	};
-
-	(@repr_direct $vis:vis $name:ident($typ:ty)) => {
-		#[derive(Default, Clone, Copy, PartialEq, Eq, bytemuck::Zeroable, bytemuck::TransparentWrapper)]
+		#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Zeroable, bytemuck::TransparentWrapper)]
 		#[repr(transparent)]
 		$vis struct $name(pub(crate) $typ);
 
-		unsafe impl $crate::underlier::WithUnderlier for $name {
-			type Underlier = $typ;
-		}
-
+		// NOTE: `new` is intentionally NOT generated here. Each field defines its own `new` so it
+		// can take an ergonomic constructor type independent of the underlier (e.g.
+		// `BinaryField128bGhash::new` takes `u128` even though its underlier is `M128`).
 		impl $name {
-			/// Wraps a raw underlier value. `const` so the field constants can be built in a const
-			/// context.
-			#[inline]
-			pub(crate) const fn from_raw(val: $typ) -> Self {
-				Self(val)
-			}
-
-			/// Returns the raw underlier value.
-			#[inline]
 			pub const fn val(self) -> $typ {
 				self.0
 			}
 		}
-	};
 
-	// Representation-agnostic impls, written through `val`/`from_raw`.
-	(@common $name:ident($typ:ty), $gen:expr) => {
+		unsafe impl $crate::underlier::WithUnderlier for $name {
+			type Underlier = $typ;
+		}
+
 		impl Neg for $name {
 			type Output = Self;
 
-			#[inline]
 			fn neg(self) -> Self::Output {
 				self
 			}
@@ -136,9 +55,8 @@ macro_rules! binary_field {
 			type Output = Self;
 
 			#[allow(clippy::suspicious_arithmetic_impl)]
-			#[inline]
 			fn add(self, rhs: Self) -> Self::Output {
-				Self::from_raw(self.val() ^ rhs.val())
+				$name(self.0 ^ rhs.0)
 			}
 		}
 
@@ -146,9 +64,8 @@ macro_rules! binary_field {
 			type Output = Self;
 
 			#[allow(clippy::suspicious_arithmetic_impl)]
-			#[inline]
 			fn add(self, rhs: &Self) -> Self::Output {
-				Self::from_raw(self.val() ^ rhs.val())
+				$name(self.0 ^ rhs.0)
 			}
 		}
 
@@ -156,9 +73,8 @@ macro_rules! binary_field {
 			type Output = Self;
 
 			#[allow(clippy::suspicious_arithmetic_impl)]
-			#[inline]
 			fn sub(self, rhs: Self) -> Self::Output {
-				Self::from_raw(self.val() ^ rhs.val())
+				$name(self.0 ^ rhs.0)
 			}
 		}
 
@@ -166,101 +82,94 @@ macro_rules! binary_field {
 			type Output = Self;
 
 			#[allow(clippy::suspicious_arithmetic_impl)]
-			#[inline]
 			fn sub(self, rhs: &Self) -> Self::Output {
-				Self::from_raw(self.val() ^ rhs.val())
+				$name(self.0 ^ rhs.0)
 			}
 		}
 
 		impl Mul<&Self> for $name {
 			type Output = Self;
 
-			#[inline]
 			fn mul(self, rhs: &Self) -> Self::Output {
 				self * *rhs
 			}
 		}
 
 		impl AddAssign<Self> for $name {
-			#[inline]
 			fn add_assign(&mut self, rhs: Self) {
 				*self = *self + rhs;
 			}
 		}
 
 		impl AddAssign<&Self> for $name {
-			#[inline]
 			fn add_assign(&mut self, rhs: &Self) {
 				*self = *self + *rhs;
 			}
 		}
 
 		impl SubAssign<Self> for $name {
-			#[inline]
 			fn sub_assign(&mut self, rhs: Self) {
 				*self = *self - rhs;
 			}
 		}
 
 		impl SubAssign<&Self> for $name {
-			#[inline]
 			fn sub_assign(&mut self, rhs: &Self) {
 				*self = *self - *rhs;
 			}
 		}
 
 		impl MulAssign<Self> for $name {
-			#[inline]
 			fn mul_assign(&mut self, rhs: Self) {
 				*self = *self * rhs;
 			}
 		}
 
 		impl MulAssign<&Self> for $name {
-			#[inline]
 			fn mul_assign(&mut self, rhs: &Self) {
-				*self = *self * *rhs;
+				*self = *self * rhs;
 			}
 		}
 
 		impl Sum<Self> for $name {
-			fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+			fn sum<I: Iterator<Item=Self>>(iter: I) -> Self {
 				iter.fold(Self::ZERO, |acc, x| acc + x)
 			}
 		}
 
 		impl<'a> Sum<&'a Self> for $name {
-			fn sum<I: Iterator<Item = &'a Self>>(iter: I) -> Self {
+			fn sum<I: Iterator<Item=&'a Self>>(iter: I) -> Self {
 				iter.fold(Self::ZERO, |acc, x| acc + x)
 			}
 		}
 
 		impl Product<Self> for $name {
-			fn product<I: Iterator<Item = Self>>(iter: I) -> Self {
+			fn product<I: Iterator<Item=Self>>(iter: I) -> Self {
 				iter.fold(Self::ONE, |acc, x| acc * x)
 			}
 		}
 
 		impl<'a> Product<&'a Self> for $name {
-			fn product<I: Iterator<Item = &'a Self>>(iter: I) -> Self {
+			fn product<I: Iterator<Item=&'a Self>>(iter: I) -> Self {
 				iter.fold(Self::ONE, |acc, x| acc * x)
 			}
 		}
 
+
 		impl Field for $name {
-			const ZERO: Self = Self::from_raw(<$typ as $crate::underlier::UnderlierType>::ZERO);
-			const ONE: Self = Self::from_raw(<$typ as $crate::underlier::UnderlierType>::ONE);
+			const ZERO: Self = $name(<$typ as $crate::underlier::UnderlierType>::ZERO);
+			const ONE: Self = $name(<$typ as $crate::underlier::UnderlierType>::ONE);
 			const CHARACTERISTIC: usize = 2;
 			const ORDER_EXPONENT: usize = <$typ as $crate::underlier::UnderlierType>::BITS;
-			const MULTIPLICATIVE_GENERATOR: $name = Self::from_raw($gen);
+			const MULTIPLICATIVE_GENERATOR: $name = $name($gen);
 
 			fn double(&self) -> Self {
 				Self::ZERO
 			}
 		}
 
-		// A field element divides into exactly one element of itself, making it a degenerate packed
-		// field of width one (see the `PackedField` impl below).
+		// A field element divides into exactly one element of itself. This makes the field a
+		// degenerate packed field of width one (see the `PackedField` impl below).
 		impl $crate::Divisible<$name> for $name {
 			const LOG_N: usize = 0;
 
@@ -300,9 +209,9 @@ macro_rules! binary_field {
 			}
 		}
 
-		// As a width-one packed field, a field element is masked by its single selector: kept when
-		// selected, otherwise zeroed. Uses the same underlier bitmask strategy as
-		// `PackedPrimitiveType` so the mask type and AND operation are consistent.
+		// As a width-one packed field, a field element is masked by its single selector: kept
+		// when selected, otherwise zeroed. Uses the same underlier bitmask strategy as
+		// PackedPrimitiveType so the mask type and AND operation are consistent.
 		impl $crate::Maskable<$name> for $name {
 			type Mask = $typ;
 
@@ -315,7 +224,7 @@ macro_rules! binary_field {
 
 			#[inline]
 			fn select(&self, mask: &$typ) -> Self {
-				Self::from_raw(self.val() & *mask)
+				Self(self.0 & *mask)
 			}
 		}
 
@@ -356,7 +265,7 @@ macro_rules! binary_field {
 
 		impl ::rand::distr::Distribution<$name> for ::rand::distr::StandardUniform {
 			fn sample<R: ::rand::Rng + ?Sized>(&self, rng: &mut R) -> $name {
-				$name::from_raw(::rand::distr::StandardUniform.sample(rng))
+				$name(::rand::distr::StandardUniform.sample(rng))
 			}
 		}
 
@@ -374,43 +283,20 @@ macro_rules! binary_field {
 			}
 		}
 
-		impl std::hash::Hash for $name {
-			#[inline]
-			fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-				self.val().hash(state);
-			}
-		}
-
-		impl PartialOrd for $name {
-			#[inline]
-			fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-				Some(self.cmp(other))
-			}
-		}
-
-		impl Ord for $name {
-			#[inline]
-			fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-				self.val().cmp(&other.val())
-			}
-		}
-
 		impl BinaryField for $name {}
 
 		impl From<$typ> for $name {
-			#[inline]
 			fn from(val: $typ) -> Self {
-				Self::from_raw(val)
+				return Self(val)
 			}
 		}
 
 		impl From<$name> for $typ {
-			#[inline]
 			fn from(val: $name) -> Self {
-				val.val()
+				return val.0
 			}
 		}
-	};
+	}
 }
 
 pub(crate) use binary_field;
@@ -427,10 +313,7 @@ macro_rules! mul_by_binary_field_1b {
 
 				$crate::tracing::trace_multiplication!(BinaryField128b, BinaryField1b);
 
-				Self::from_underlier(
-					self.to_underlier()
-						& <$name as WithUnderlier>::Underlier::fill_with_bit(u8::from(rhs.val())),
-				)
+				Self(self.0 & <$name as WithUnderlier>::Underlier::fill_with_bit(u8::from(rhs.0)))
 			}
 		}
 	};
@@ -445,15 +328,15 @@ macro_rules! impl_field_extension {
 
 			#[inline]
 			fn try_from(elem: $name) -> Result<Self, Self::Error> {
-				use $crate::underlier::{Divisible, NumCast, UnderlierType, WithUnderlier};
+				use $crate::underlier::{Divisible, NumCast, UnderlierType};
 
 				// `elem` lies in the subfield iff every subfield-underlier limb above the
 				// least-significant one is zero (equivalent to `elem >> N_BITS == 0`).
-				let in_subfield = Divisible::<$subfield_typ>::ref_iter(elem.to_underlier_ref())
+				let in_subfield = Divisible::<$subfield_typ>::ref_iter(&elem.0)
 					.skip(1)
 					.all(|limb| limb == <$subfield_typ as UnderlierType>::ZERO);
 				if in_subfield {
-					Ok($subfield_name::from_underlier(<$subfield_typ>::num_cast_from(elem.val())))
+					Ok($subfield_name(<$subfield_typ>::num_cast_from(elem.val())))
 				} else {
 					Err(())
 				}
@@ -463,9 +346,7 @@ macro_rules! impl_field_extension {
 		impl From<$subfield_name> for $name {
 			#[inline]
 			fn from(elem: $subfield_name) -> Self {
-				use $crate::underlier::WithUnderlier;
-
-				$name::from_underlier(<$typ>::from(elem.val()))
+				$name(<$typ>::from(elem.val()))
 			}
 		}
 
@@ -541,7 +422,7 @@ macro_rules! impl_field_extension {
 
 			#[inline]
 			fn basis(i: usize) -> Self {
-				use $crate::underlier::{Divisible, UnderlierType, WithUnderlier};
+				use $crate::underlier::{Divisible, UnderlierType};
 
 				assert!(
 					i < 1 << $log_degree,
@@ -557,7 +438,7 @@ macro_rules! impl_field_extension {
 					i,
 					<$subfield_typ as UnderlierType>::ONE,
 				);
-				Self::from_underlier(underlier)
+				Self(underlier)
 			}
 
 			#[inline]
@@ -565,7 +446,7 @@ macro_rules! impl_field_extension {
 				base_elems: impl IntoIterator<Item = $subfield_name>,
 				log_stride: usize,
 			) -> Self {
-				use $crate::underlier::{Divisible, UnderlierType, WithUnderlier};
+				use $crate::underlier::{Divisible, UnderlierType};
 
 				debug_assert!($name::N_BITS.is_power_of_two());
 				let shift_step = ($subfield_name::N_BITS << log_stride) & ($name::N_BITS - 1);
@@ -582,7 +463,7 @@ macro_rules! impl_field_extension {
 					shift += shift_step;
 				}
 
-				Self::from_underlier(underlier)
+				Self(underlier)
 			}
 
 			#[inline]
@@ -590,10 +471,8 @@ macro_rules! impl_field_extension {
 				use binius_utils::iter::IterExtensions;
 				use $crate::underlier::{Divisible, WithUnderlier};
 
-				Divisible::<<$subfield_name as WithUnderlier>::Underlier>::ref_iter(
-					self.to_underlier_ref(),
-				)
-				.map_skippable($subfield_name::from)
+				Divisible::<<$subfield_name as WithUnderlier>::Underlier>::ref_iter(&self.0)
+					.map_skippable($subfield_name::from)
 			}
 
 			#[inline]
@@ -601,10 +480,8 @@ macro_rules! impl_field_extension {
 				use binius_utils::iter::IterExtensions;
 				use $crate::underlier::{Divisible, WithUnderlier};
 
-				Divisible::<<$subfield_name as WithUnderlier>::Underlier>::value_iter(
-					self.to_underlier(),
-				)
-				.map_skippable($subfield_name::from)
+				Divisible::<<$subfield_name as WithUnderlier>::Underlier>::value_iter(self.0)
+					.map_skippable($subfield_name::from)
 			}
 
 			#[inline]
@@ -628,21 +505,82 @@ macro_rules! impl_field_extension {
 
 pub(crate) use impl_field_extension;
 
+/// Implements a field's arithmetic via its width-one `PackedPrimitiveType<$typ, Self>` packing.
+///
+/// The field stays a newtype over `$typ`.
+/// The packing is the single source of truth for `Mul`/`Square`/`InvertOrZero`/`WideMul`.
+macro_rules! impl_arithmetic_via_packed {
+	($name:ident, $typ:ty) => {
+		impl Mul<Self> for $name {
+			type Output = Self;
+
+			#[inline]
+			fn mul(self, rhs: Self) -> Self {
+				$crate::tracing::trace_multiplication!($name);
+				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				Self((P::from_underlier(self.0) * P::from_underlier(rhs.0)).to_underlier())
+			}
+		}
+
+		impl $crate::arithmetic_traits::Square for $name {
+			#[inline]
+			fn square(self) -> Self {
+				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				Self(
+					$crate::arithmetic_traits::Square::square(P::from_underlier(self.0)).to_underlier(),
+				)
+			}
+		}
+
+		impl $crate::arithmetic_traits::InvertOrZero for $name {
+			#[inline]
+			fn invert_or_zero(self) -> Self {
+				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				Self(
+					$crate::arithmetic_traits::InvertOrZero::invert_or_zero(P::from_underlier(self.0))
+						.to_underlier(),
+				)
+			}
+		}
+
+		impl $crate::arithmetic_traits::WideMul for $name {
+			type Output = <$crate::arch::PackedPrimitiveType<$typ, $name> as $crate::arithmetic_traits::WideMul>::Output;
+
+			#[inline]
+			fn wide_mul(a: Self, b: Self) -> Self::Output {
+				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				<P as $crate::arithmetic_traits::WideMul>::wide_mul(
+					P::from_underlier(a.0),
+					P::from_underlier(b.0),
+				)
+			}
+
+			#[inline]
+			fn reduce(wide: Self::Output) -> Self {
+				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				Self(<P as $crate::arithmetic_traits::WideMul>::reduce(wide).to_underlier())
+			}
+		}
+	};
+}
+
+pub(crate) use impl_arithmetic_via_packed;
+
 binary_field!(pub BinaryField1b(U1), U1::new(0x1));
 
-crate::arithmetic_traits::impl_trivial_wide_mul!(BinaryField1b);
+impl_arithmetic_via_packed!(BinaryField1b, U1);
 
 macro_rules! serialize_deserialize {
 	($bin_type:ty) => {
 		impl SerializeBytes for $bin_type {
 			fn serialize(&self, write_buf: impl BufMut) -> Result<(), SerializationError> {
-				self.val().serialize(write_buf)
+				self.0.serialize(write_buf)
 			}
 		}
 
 		impl DeserializeBytes for $bin_type {
 			fn deserialize(read_buf: impl Buf) -> Result<Self, SerializationError> {
-				Ok(Self::from_raw(DeserializeBytes::deserialize(read_buf)?))
+				Ok(Self(DeserializeBytes::deserialize(read_buf)?))
 			}
 		}
 	};
@@ -656,7 +594,7 @@ impl FixedSizeSerializeBytes for BinaryField1b {
 
 impl BinaryField1b {
 	pub const fn new(value: U1) -> Self {
-		Self::from_raw(value)
+		Self(value)
 	}
 
 	/// Creates value without checking that it is within valid range (0 or 1)

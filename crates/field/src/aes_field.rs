@@ -11,10 +11,12 @@ use binius_utils::{
 	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
 	bytes::{Buf, BufMut},
 };
-use bytemuck::Pod;
+use bytemuck::{Pod, Zeroable};
 
 use super::{
-	binary_field::{BinaryField, BinaryField1b, binary_field, impl_field_extension},
+	binary_field::{
+		BinaryField, BinaryField1b, binary_field, impl_arithmetic_via_packed, impl_field_extension,
+	},
 	mul_by_binary_field_1b,
 };
 use crate::{ExtensionField, Field, underlier::U1};
@@ -30,31 +32,12 @@ binary_field!(pub AESTowerField8b(u8), 0xD0);
 
 impl AESTowerField8b {
 	pub const fn new(value: u8) -> Self {
-		Self::from_raw(value)
+		Self(value)
 	}
 }
 
-// `WideMul` for the AES tower field is a direct log/exp-table multiply that already produces the
-// reduced 8-bit element, so the wide product is `Self` and `reduce` is the identity. This is also
-// the single source of truth for the portable packed AES multiply (see `AesLookupWideMul` and the
-// elementwise strategy in the packed AES modules).
-impl crate::arithmetic_traits::WideMul for AESTowerField8b {
-	type Output = Self;
-
-	#[inline]
-	fn wide_mul(a: Self, b: Self) -> Self {
-		Self::new(aes_mul_8b(a.val(), b.val()))
-	}
-
-	#[inline]
-	fn reduce(wide: Self) -> Self {
-		wide
-	}
-}
-
-/// Multiplies two `AESTowerField8b` elements (as raw bytes) via the tower-field log/exp tables,
-/// returning the reduced product. Shared by the scalar `WideMul` and the portable packed AES
-/// widening multiply.
+/// Multiplies two `AESTowerField8b` elements (as raw bytes) via the tower-field log/exp tables.
+/// The packed AES widening multiply builds on this, and the scalar arithmetic delegates to it.
 #[inline]
 pub(crate) fn aes_mul_8b(lhs: u8, rhs: u8) -> u8 {
 	if lhs != 0 && rhs != 0 {
@@ -118,6 +101,8 @@ unsafe impl Pod for AESTowerField8b {}
 impl_field_extension!(BinaryField1b(U1) < @3 => AESTowerField8b(u8));
 
 mul_by_binary_field_1b!(AESTowerField8b);
+
+impl_arithmetic_via_packed!(AESTowerField8b, u8);
 
 impl SerializeBytes for AESTowerField8b {
 	fn serialize(&self, write_buf: impl BufMut) -> Result<(), SerializationError> {

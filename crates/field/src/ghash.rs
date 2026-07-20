@@ -14,14 +14,16 @@ use binius_utils::{
 	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
 	bytes::{Buf, BufMut},
 };
-use bytemuck::Pod;
+use bytemuck::{Pod, Zeroable};
 
 use super::{
-	binary_field::{BinaryField, BinaryField1b, binary_field, impl_field_extension},
+	binary_field::{
+		BinaryField, BinaryField1b, binary_field, impl_arithmetic_via_packed, impl_field_extension,
+	},
 	extension::ExtensionField,
 };
 use crate::{
-	AESTowerField8b, Field, PackedBinaryGhash1x128b, WideMul,
+	AESTowerField8b, Field,
 	arch::M128,
 	mul_by_binary_field_1b,
 	underlier::{U1, WithUnderlier},
@@ -34,28 +36,13 @@ binary_field!(pub BinaryField128bGhash(M128), M128::from_u128(0x494ef99794d5244f
 // is a distinct type from `u128` on every target, so these never collide with the macro's impls.
 impl From<u128> for BinaryField128bGhash {
 	fn from(value: u128) -> Self {
-		Self::from_raw(M128::from(value))
+		Self(M128::from(value))
 	}
 }
 
 impl From<BinaryField128bGhash> for u128 {
 	fn from(value: BinaryField128bGhash) -> Self {
-		value.val().into()
-	}
-}
-
-// The deferred-reduction widening multiply is inherited from the width-1 packing (`self.0`).
-impl WideMul for BinaryField128bGhash {
-	type Output = <PackedBinaryGhash1x128b as WideMul>::Output;
-
-	#[inline]
-	fn wide_mul(a: Self, b: Self) -> Self::Output {
-		<PackedBinaryGhash1x128b as WideMul>::wide_mul(a.0, b.0)
-	}
-
-	#[inline]
-	fn reduce(wide: Self::Output) -> Self {
-		Self(<PackedBinaryGhash1x128b as WideMul>::reduce(wide))
+		value.0.into()
 	}
 }
 
@@ -65,7 +52,7 @@ impl BinaryField128bGhash {
 	/// Constructs an element from its `u128` value. The underlier is `M128`, but `u128` is the
 	/// ergonomic constructor type, so this converts.
 	pub const fn new(value: u128) -> Self {
-		Self::from_raw(M128::from_u128(value))
+		Self(M128::from_u128(value))
 	}
 
 	#[inline]
@@ -100,6 +87,8 @@ impl BinaryField128bGhash {
 		Self::new(result)
 	}
 }
+
+impl_arithmetic_via_packed!(BinaryField128bGhash, M128);
 
 impl_field_extension!(BinaryField1b(U1) < @7 => BinaryField128bGhash(M128));
 
@@ -388,7 +377,7 @@ impl From<AESTowerField8b> for BinaryField128bGhash {
 			0x71af641f08dbd1a0990483806bffbe0d,
 		];
 
-		BinaryField128bGhash::new(LOOKUP_TABLE[value.val() as usize])
+		BinaryField128bGhash::new(LOOKUP_TABLE[value.0 as usize])
 	}
 }
 

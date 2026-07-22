@@ -14,17 +14,17 @@ use binius_utils::{
 	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
 	bytes::{Buf, BufMut},
 };
-use bytemuck::{Pod, TransparentWrapper, Zeroable};
+use bytemuck::{Pod, Zeroable};
 
 use super::{
-	binary_field::{BinaryField, BinaryField1b, binary_field, impl_field_extension},
+	binary_field::{
+		BinaryField, BinaryField1b, binary_field, impl_arithmetic_via_packed, impl_field_extension,
+	},
 	extension::ExtensionField,
 };
 use crate::{
-	AESTowerField8b, Field, PackedBinaryGhash1x128b, WideMul,
-	arch::{GhashWideMul1x, M128, invert_b128},
-	arithmetic_traits::{InvertOrZero, Square},
-	binary_field_arithmetic::square_using_packed,
+	AESTowerField8b, Field,
+	arch::M128,
 	mul_by_binary_field_1b,
 	underlier::{U1, WithUnderlier},
 };
@@ -43,36 +43,6 @@ impl From<u128> for BinaryField128bGhash {
 impl From<BinaryField128bGhash> for u128 {
 	fn from(value: BinaryField128bGhash) -> Self {
 		value.0.into()
-	}
-}
-
-// Deferred-reduction widening multiply via the optimal `GhashWideMul` wrapper applied to the
-// width-1 `PackedBinaryGhash1x128b` packing. The scalar and the packing share the `M128` underlier,
-// so the conversions are zero-cost reinterprets.
-//
-// This routes the scalar through the packed type's wrapper rather than wrapping the scalar
-// directly. It relies on every M128 GHASH packing using a deferring wrapper whose `Output` is a
-// concrete `WideGhashProduct` (not the packed type itself): `WideMul` is a supertrait of both
-// `Field` and `PackedField`, and `BinaryField128bGhash` is the `Scalar` of
-// `PackedBinaryGhash1x128b`, so a trivial fallback (whose `Output` is the packed type,
-// bounded `Add + Mul`) would close a trait-resolution cycle through `Field: WideMul`.
-impl WideMul for BinaryField128bGhash {
-	type Output = <GhashWideMul1x<PackedBinaryGhash1x128b> as WideMul>::Output;
-
-	#[inline]
-	fn wide_mul(a: Self, b: Self) -> Self::Output {
-		let a = PackedBinaryGhash1x128b::from_underlier(a.to_underlier());
-		let b = PackedBinaryGhash1x128b::from_underlier(b.to_underlier());
-		<GhashWideMul1x<PackedBinaryGhash1x128b> as WideMul>::wide_mul(
-			GhashWideMul1x::wrap(a),
-			GhashWideMul1x::wrap(b),
-		)
-	}
-
-	#[inline]
-	fn reduce(wide: Self::Output) -> Self {
-		let reduced = <GhashWideMul1x<PackedBinaryGhash1x128b> as WideMul>::reduce(wide);
-		Self::from_underlier(GhashWideMul1x::peel(reduced).to_underlier())
 	}
 }
 
@@ -118,32 +88,7 @@ impl BinaryField128bGhash {
 	}
 }
 
-// Multiplication is `reduce(wide_mul)`, deferring to the scalar's own `WideMul` impl above (which
-// routes through the optimal `GhashWideMul` packing). This keeps the widening multiply as the
-// single source of truth for both `Mul` and `WideMul`.
-impl Mul<BinaryField128bGhash> for BinaryField128bGhash {
-	type Output = Self;
-
-	#[inline]
-	fn mul(self, rhs: Self) -> Self {
-		crate::tracing::trace_multiplication!(BinaryField128bGhash);
-		Self::reduce(Self::wide_mul(self, rhs))
-	}
-}
-
-impl Square for BinaryField128bGhash {
-	#[inline]
-	fn square(self) -> Self {
-		square_using_packed::<PackedBinaryGhash1x128b>(self)
-	}
-}
-
-impl InvertOrZero for BinaryField128bGhash {
-	#[inline]
-	fn invert_or_zero(self) -> Self {
-		invert_b128(self)
-	}
-}
+impl_arithmetic_via_packed!(BinaryField128bGhash, M128);
 
 impl_field_extension!(BinaryField1b(U1) < @7 => BinaryField128bGhash(M128));
 
@@ -441,7 +386,10 @@ mod tests {
 	use proptest::{prelude::any, proptest};
 
 	use super::*;
-	use crate::{WideMul, binary_field::tests::is_binary_field_valid_generator};
+	use crate::{
+		WideMul, arithmetic_traits::InvertOrZero,
+		binary_field::tests::is_binary_field_valid_generator,
+	};
 
 	#[test]
 	fn test_ghash_mul() {

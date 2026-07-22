@@ -496,9 +496,70 @@ macro_rules! impl_field_extension {
 
 pub(crate) use impl_field_extension;
 
+/// Implements a field's arithmetic via its width-one `PackedPrimitiveType<$typ, Self>` packing.
+///
+/// The field stays a newtype over `$typ`.
+/// The packing is the single source of truth for `Mul`/`Square`/`InvertOrZero`/`WideMul`.
+macro_rules! impl_arithmetic_via_packed {
+	($name:ident, $typ:ty) => {
+		impl Mul<Self> for $name {
+			type Output = Self;
+
+			#[inline]
+			fn mul(self, rhs: Self) -> Self {
+				$crate::tracing::trace_multiplication!($name);
+				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				Self((P::from_underlier(self.0) * P::from_underlier(rhs.0)).to_underlier())
+			}
+		}
+
+		impl $crate::arithmetic_traits::Square for $name {
+			#[inline]
+			fn square(self) -> Self {
+				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				Self(
+					$crate::arithmetic_traits::Square::square(P::from_underlier(self.0)).to_underlier(),
+				)
+			}
+		}
+
+		impl $crate::arithmetic_traits::InvertOrZero for $name {
+			#[inline]
+			fn invert_or_zero(self) -> Self {
+				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				Self(
+					$crate::arithmetic_traits::InvertOrZero::invert_or_zero(P::from_underlier(self.0))
+						.to_underlier(),
+				)
+			}
+		}
+
+		impl $crate::arithmetic_traits::WideMul for $name {
+			type Output = <$crate::arch::PackedPrimitiveType<$typ, $name> as $crate::arithmetic_traits::WideMul>::Output;
+
+			#[inline]
+			fn wide_mul(a: Self, b: Self) -> Self::Output {
+				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				<P as $crate::arithmetic_traits::WideMul>::wide_mul(
+					P::from_underlier(a.0),
+					P::from_underlier(b.0),
+				)
+			}
+
+			#[inline]
+			fn reduce(wide: Self::Output) -> Self {
+				type P = $crate::arch::PackedPrimitiveType<$typ, $name>;
+				Self(<P as $crate::arithmetic_traits::WideMul>::reduce(wide).to_underlier())
+			}
+		}
+	};
+}
+
+pub(crate) use impl_arithmetic_via_packed;
+
 binary_field!(pub BinaryField1b(U1), U1::new(0x1));
 
-crate::arithmetic_traits::impl_trivial_wide_mul!(BinaryField1b);
+impl_arithmetic_via_packed!(BinaryField1b, U1);
 
 macro_rules! serialize_deserialize {
 	($bin_type:ty) => {

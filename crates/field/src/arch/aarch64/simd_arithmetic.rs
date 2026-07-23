@@ -148,42 +148,72 @@ pub fn packed_aes_16x8b_wide_mul(a: M128, b: M128) -> WideAes16x8bProduct {
 }
 
 /// Reduces an accumulated [`WideAes16x8bProduct`] back to the packed GF(2^8) bytes.
+///
+/// # Overview
+///
+/// Each 16-bit lane holds a carryless product, or an XOR-accumulation of such products.
+/// The low byte carries degrees 0..7 and passes through unchanged.
+/// The high byte carries degrees 8..15 and folds down mod p(x) = x^8 + x^4 + x^3 + x + 1.
+///
+/// # Nibble tables
+///
+/// The fold is F_2-linear in the high byte's 8 bits.
+/// Splitting the byte into two 4-bit nibbles turns the fold into two 16-entry lookups:
+///
+/// ```text
+///     RED_LO[b3 b2 b1 b0] = b0*(x^8  mod p) + b1*(x^9  mod p) + b2*(x^10 mod p) + b3*(x^11 mod p)
+///     RED_HI[b3 b2 b1 b0] = b0*(x^12 mod p) + b1*(x^13 mod p) + b2*(x^14 mod p) + b3*(x^15 mod p)
+/// ```
+///
+/// Two byte-shuffle lookups replace a two-stage Barrett fold of four carryless multiplies.
+/// M-series cores issue four byte shuffles per cycle but only two carryless multiplies.
+/// The packed squaring above reduces its high nibble through the same table scheme.
 #[inline]
 pub fn packed_aes_16x8b_reduce(wide: WideAes16x8bProduct) -> M128 {
-	// Reduces the 16-bit output of a carryless multiplication to 8 bits using equation 22 in
-	// https://www.intel.com/content/dam/develop/external/us/en/documents/clmul-wp-rev-2-02-2014-04-20.pdf
 	unsafe {
 		let WideAes16x8bProduct { c0, c1 } = wide;
 
-		// Deinterleave the 16 per-byte carryless products into their low bytes (`lo`) and high
-		// bytes (`hi`, the part above `x^7` that the reduction folds back down).
-		let c0 = vreinterpretq_p8_p16(c0);
-		let c1 = vreinterpretq_p8_p16(c1);
+		// Deinterleave the 16 per-byte products into their low and high bytes.
+		//
+		//     c0 bytes: [ l0 h0 l1 h1 ... l7  h7  ]
+		//     c1 bytes: [ l8 h8 l9 h9 ... l15 h15 ]
+		//     cl      = [ l0 l1 ... l15 ]  (degrees 0..7, kept)
+		//     ch      = [ h0 h1 ... h15 ]  (degrees 8..15, folded below)
+		let c0 = vreinterpretq_u8_p16(c0);
+		let c1 = vreinterpretq_u8_p16(c1);
 
-		let cl = vuzp1q_p8(c0, c1);
-		let ch = vuzp2q_p8(c0, c1);
+		let cl = vuzp1q_u8(c0, c1);
+		let ch = vuzp2q_u8(c0, c1);
 
-		// Since q+(x) doesn't fit into 8 bits, we right shift the polynomial (divide by x) and
-		// correct for this later. This works because q+(x) is divisible by x/the last polynomial
-		// bit is 0. q+(x)/x = (x^8 + x^4 + x^3 + x)/x = 0b100011010 >> 1 = 0b10001101 = 0x8d
-		const QPLUS_RSH1: poly8x8_t = unsafe { std::mem::transmute(0x8d8d8d8d8d8d8d8d_u64) };
+		// Reductions of x^8, x^9, x^10, x^11 mod p(x): 0x1B, 0x36, 0x6C, 0xD8.
+		// Entry n is the XOR of the values selected by n's set bits.
+		let red_lo = vld1q_u8(
+			[
+				0x00, 0x1B, 0x36, 0x2D, 0x6C, 0x77, 0x5A, 0x41, 0xD8, 0xC3, 0xEE, 0xF5, 0xB4, 0xAF,
+				0x82, 0x99,
+			]
+			.as_ptr(),
+		);
 
-		// q*(x) = x^4 + x^3 + x + 1 = 0b00011011 = 0x1b
-		const QSTAR: poly8x8_t = unsafe { std::mem::transmute(0x1b1b1b1b1b1b1b1b_u64) };
+		// Reductions of x^12, x^13, x^14, x^15 mod p(x): 0xAB, 0x4D, 0x9A, 0x2F.
+		// Entry n is the XOR of the values selected by n's set bits.
+		let red_hi = vld1q_u8(
+			[
+				0x00, 0xAB, 0x4D, 0xE6, 0x9A, 0x31, 0xD7, 0x7C, 0x2F, 0x84, 0x62, 0xC9, 0xB5, 0x1E,
+				0xF8, 0x53,
+			]
+			.as_ptr(),
+		);
 
-		let tmp0 = vmull_p8(vget_low_p8(ch), QPLUS_RSH1);
-		let tmp1 = vmull_p8(vget_high_p8(ch), QPLUS_RSH1);
+		// Split each high byte into its two table indices.
+		let lo_nibble = vandq_u8(ch, vdupq_n_u8(0x0F));
+		let hi_nibble = vshrq_n_u8(ch, 4);
 
-		// Correct for q+(x) having been divided by x
-		let tmp0 = vreinterpretq_p8_u16(vshlq_n_u16(vreinterpretq_u16_p16(tmp0), 1));
-		let tmp1 = vreinterpretq_p8_u16(vshlq_n_u16(vreinterpretq_u16_p16(tmp1), 1));
+		// Fold the whole high byte below x^8: one lookup per nibble, XOR-combined.
+		let folded = veorq_u8(vqtbl1q_u8(red_lo, lo_nibble), vqtbl1q_u8(red_hi, hi_nibble));
 
-		let tmp_hi = vuzp2q_p8(tmp0, tmp1);
-		let tmp0 = vreinterpretq_p8_p16(vmull_p8(vget_low_p8(tmp_hi), QSTAR));
-		let tmp1 = vreinterpretq_p8_p16(vmull_p8(vget_high_p8(tmp_hi), QSTAR));
-		let tmp_lo = vuzp1q_p8(tmp0, tmp1);
-
-		vreinterpretq_p128_p8(vaddq_p8(cl, tmp_lo)).into()
+		// Reduced lane = low byte + folded high byte.
+		vreinterpretq_p128_u8(veorq_u8(cl, folded)).into()
 	}
 }
 

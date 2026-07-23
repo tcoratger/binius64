@@ -161,9 +161,117 @@ mod test_utils {
 		};
 	}
 
+	/// Test the widening multiply against the plain multiply for all AES packings.
+	macro_rules! define_wide_mul_tests {
+		() => {
+			fn check_widening_correctness<P>(a: P::Underlier, b: P::Underlier)
+			where
+				P: $crate::PackedField<Scalar = $crate::AESTowerField8b>
+					+ $crate::WideMul
+					+ $crate::underlier::WithUnderlier,
+			{
+				let a = P::from_underlier(a);
+				let b = P::from_underlier(b);
+				// One deferred product, reduced immediately, must equal the plain multiply.
+				let wide = P::wide_mul(a, b);
+				let reduced = P::reduce(wide);
+				assert_eq!(reduced, a * b);
+			}
+
+			fn check_widening_linearity<P>(
+				a1: P::Underlier,
+				b1: P::Underlier,
+				a2: P::Underlier,
+				b2: P::Underlier,
+			) where
+				P: $crate::PackedField<Scalar = $crate::AESTowerField8b>
+					+ $crate::WideMul
+					+ $crate::underlier::WithUnderlier,
+			{
+				let (a1, b1) = (P::from_underlier(a1), P::from_underlier(b1));
+				let (a2, b2) = (P::from_underlier(a2), P::from_underlier(b2));
+				// Accumulated products reduce once at the end.
+				// The sum reaches wide values no single product produces, so this covers the
+				// reduction's full accumulated domain, not just fresh products.
+				let sum_reduced = P::reduce(P::wide_mul(a1, b1) + P::wide_mul(a2, b2));
+				assert_eq!(sum_reduced, a1 * b1 + a2 * b2);
+			}
+
+			proptest! {
+				#[test]
+				fn test_wide_mul_correctness_8(a in any::<u8>(), b in any::<u8>()) {
+					check_widening_correctness::<$crate::PackedAESBinaryField1x8b>(a, b);
+				}
+
+				#[test]
+				fn test_wide_mul_correctness_128(a in any::<u128>(), b in any::<u128>()) {
+					check_widening_correctness::<$crate::PackedAESBinaryField16x8b>(
+						a.into(),
+						b.into(),
+					);
+				}
+
+				#[test]
+				fn test_wide_mul_correctness_256(a in any::<[u128; 2]>(), b in any::<[u128; 2]>()) {
+					check_widening_correctness::<$crate::PackedAESBinaryField32x8b>(
+						a.into(),
+						b.into(),
+					);
+				}
+
+				#[test]
+				fn test_wide_mul_correctness_512(a in any::<[u128; 4]>(), b in any::<[u128; 4]>()) {
+					check_widening_correctness::<$crate::PackedAESBinaryField64x8b>(
+						a.into(),
+						b.into(),
+					);
+				}
+
+				#[test]
+				fn test_wide_mul_linearity_8(
+					a1 in any::<u8>(), b1 in any::<u8>(),
+					a2 in any::<u8>(), b2 in any::<u8>(),
+				) {
+					check_widening_linearity::<$crate::PackedAESBinaryField1x8b>(a1, b1, a2, b2);
+				}
+
+				#[test]
+				fn test_wide_mul_linearity_128(
+					a1 in any::<u128>(), b1 in any::<u128>(),
+					a2 in any::<u128>(), b2 in any::<u128>(),
+				) {
+					check_widening_linearity::<$crate::PackedAESBinaryField16x8b>(
+						a1.into(), b1.into(), a2.into(), b2.into(),
+					);
+				}
+
+				#[test]
+				fn test_wide_mul_linearity_256(
+					a1 in any::<[u128; 2]>(), b1 in any::<[u128; 2]>(),
+					a2 in any::<[u128; 2]>(), b2 in any::<[u128; 2]>(),
+				) {
+					check_widening_linearity::<$crate::PackedAESBinaryField32x8b>(
+						a1.into(), b1.into(), a2.into(), b2.into(),
+					);
+				}
+
+				#[test]
+				fn test_wide_mul_linearity_512(
+					a1 in any::<[u128; 4]>(), b1 in any::<[u128; 4]>(),
+					a2 in any::<[u128; 4]>(), b2 in any::<[u128; 4]>(),
+				) {
+					check_widening_linearity::<$crate::PackedAESBinaryField64x8b>(
+						a1.into(), b1.into(), a2.into(), b2.into(),
+					);
+				}
+			}
+		};
+	}
+
 	pub(crate) use define_invert_tests;
 	pub(crate) use define_multiply_tests;
 	pub(crate) use define_square_tests;
+	pub(crate) use define_wide_mul_tests;
 }
 
 #[cfg(test)]
@@ -172,9 +280,11 @@ mod tests {
 
 	use proptest::prelude::*;
 
-	use super::test_utils::{define_invert_tests, define_multiply_tests, define_square_tests};
+	use super::test_utils::{
+		define_invert_tests, define_multiply_tests, define_square_tests, define_wide_mul_tests,
+	};
 	use crate::{
-		PackedField,
+		PackedField, WideMul,
 		arithmetic_traits::{InvertOrZero, Square},
 	};
 
@@ -183,4 +293,36 @@ mod tests {
 	define_square_tests!(Square::square, PackedField);
 
 	define_invert_tests!(InvertOrZero::invert_or_zero, PackedField);
+
+	define_wide_mul_tests!();
+
+	#[test]
+	fn test_wide_mul_exhaustive_scalar_pairs() {
+		// The scalar field has only 2^8 elements, so every product admits an exhaustive check.
+		// Each byte pair is broadcast across the 128-bit packing and multiplied deferred.
+		//
+		//     reduce(wide_mul(a, b)) must equal the scalar product in every lane.
+		//
+		// The scalar multiply is an independent oracle: it runs the tower-field log/exp tables,
+		// not the packed widening path under test.
+		for a in 0..=u8::MAX {
+			for b in 0..=u8::MAX {
+				let expected = crate::AESTowerField8b::new(a) * crate::AESTowerField8b::new(b);
+
+				let a_packed =
+					crate::PackedAESBinaryField16x8b::broadcast(crate::AESTowerField8b::new(a));
+				let b_packed =
+					crate::PackedAESBinaryField16x8b::broadcast(crate::AESTowerField8b::new(b));
+				let reduced = crate::PackedAESBinaryField16x8b::reduce(
+					crate::PackedAESBinaryField16x8b::wide_mul(a_packed, b_packed),
+				);
+
+				assert_eq!(
+					reduced,
+					crate::PackedAESBinaryField16x8b::broadcast(expected),
+					"a={a:#04x} b={b:#04x}"
+				);
+			}
+		}
+	}
 }

@@ -171,11 +171,14 @@ impl<F: BinaryField, C> ProxTestOracle<F> for BatchBrakedownOracle<F, C> {
 	}
 }
 
-/// A [ProxTestOracle] implementation for a FRI-style code proximity check.
+/// A single FRI reduction: one committed oracle, and the fold of each opened coset.
 ///
 /// Note that this is distinct from the full FRI query-phase verifier in the `verify` module. This
 /// one only verifies the openings of a single committed oracle and folds each opened coset into a
 /// single value using FRI folding.
+///
+/// Unlike a [`ProxTestOracle`], this reduces *claims* about the base codeword rather than opening
+/// the virtual oracle outright — see [`Self::reduce_queries`].
 pub struct FRIOracle<F, C, DC>
 where
 	DC: DomainContext<Field = F>,
@@ -203,6 +206,11 @@ where
 			depth,
 			domain_context,
 		}
+	}
+
+	/// The base-2 logarithm of the length of the virtual (folded) oracle.
+	const fn log_len(&self) -> usize {
+		self.depth
 	}
 
 	/// The base-2 log of the size of each coset opened from the committed oracle.
@@ -315,33 +323,6 @@ where
 	}
 
 	values[0]
-}
-
-impl<F, C, DC> ProxTestOracle<F> for FRIOracle<F, C, DC>
-where
-	F: BinaryField,
-	DC: DomainContext<Field = F>,
-{
-	type Commitment = C;
-
-	fn log_len(&self) -> usize {
-		self.depth
-	}
-
-	fn open_queries<Channel>(
-		&self,
-		indices: &[usize],
-		channel: &mut Channel,
-	) -> Result<Vec<F>, Error>
-	where
-		Channel: MerkleIPVerifierChannel<F, Commitment = C>,
-	{
-		assert!(indices.iter().all(|&index| index < 1 << self.log_len())); // precondition
-		let values = channel.recv_openings(&self.commitment, indices)?;
-		Ok(iter::zip(values.chunks(1 << self.coset_log_size()), indices)
-			.map(|(coset, &index)| self.fold_coset(index, coset.to_vec()))
-			.collect())
-	}
 }
 
 #[derive(Debug, thiserror::Error)]
